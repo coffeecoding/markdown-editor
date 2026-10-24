@@ -188,10 +188,14 @@ These timings depend on fonts and hardware; run the benchmark for local results.
 ## Roadmap
 
 - [x] Table rendering
-- [ ] Emoji support
 - [ ] Recent files
-- [ ] Status bar
+- [x] Scroll-wheel zoom
 - [x] Application icon
 - [ ] Application license
 - [ ] Build pipeline and GitHub releases
 - [ ] Configurable line height in edit-mode
+
+### Further down the road
+
+- [!] Emoji support -> Support path doc added
+- [ ] Status bar
