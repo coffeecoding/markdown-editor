@@ -502,6 +502,41 @@ try {
         $ratio = if ($zoom[0] -eq 0 -and $zoom[1] -eq 0) { 1.0 } elseif ($zoom[1] -gt 0) { $zoom[0] / $zoom[1] } else { -1 }
         Assert ([Math]::Abs($ratio - $testDpi / [double]$systemDpi) -lt 0.01) "DPI handler applies $testDpi DPI text scaling (zoom $($zoom[0])/$($zoom[1]))"
     }
+    # Application zoom consumes partial and multiple Ctrl+wheel notches.
+    $baseZoom = [MdSmoke]::Zoom($blank.Id,$view)
+    $baseRatio = if ($baseZoom[1] -eq 0) { 1.0 } else { $baseZoom[0] / [double]$baseZoom[1] }
+    function Check-Zoom($percent) {
+        foreach ($control in @($source,$view)) {
+            $z = [MdSmoke]::Zoom($blank.Id,$control)
+            $r = if ($z[1] -eq 0) { 1.0 } else { $z[0] / [double]$z[1] }
+            Assert ([Math]::Abs($r - $baseRatio * $percent / 100) -lt 0.001) "both controls use $percent percent zoom"
+        }
+    }
+    [void][MdSmoke]::Send($view,522,[IntPtr]((60 -shl 16) -bor 8),[IntPtr]::Zero)
+    Check-Zoom 100
+    [void][MdSmoke]::Send($view,522,[IntPtr]((60 -shl 16) -bor 8),[IntPtr]::Zero)
+    Check-Zoom 110
+    [void][MdSmoke]::Send($view,522,[IntPtr]((240 -shl 16) -bor 8),[IntPtr]::Zero)
+    Check-Zoom 130
+    [void][MdSmoke]::Rectangle($w,736,[IntPtr]((192 -shl 16) -bor 192),[ref]$rect)
+    $baseRatio = 192 / [double]$systemDpi
+    Check-Zoom 130
+    [void][MdSmoke]::Rectangle($w,736,[IntPtr](($systemDpi -shl 16) -bor $systemDpi),[ref]$rect)
+    $baseRatio = 1.0
+    Check-Zoom 130
+    Command $w 200
+    Check-Zoom 130
+    [void][MdSmoke]::Send($source,522,[IntPtr]((2400 -shl 16) -bor 8),[IntPtr]::Zero)
+    Check-Zoom 300
+    [void][MdSmoke]::Send($source,522,[IntPtr]((-3600 -shl 16) -bor 8),[IntPtr]::Zero)
+    Check-Zoom 50
+    [void][MdSmoke]::Send($source,522,[IntPtr]((60 -shl 16) -bor 8),[IntPtr]::Zero)
+    [void][MdSmoke]::Send($source,257,[IntPtr]17,[IntPtr]::Zero)
+    [void][MdSmoke]::Send($source,522,[IntPtr]((60 -shl 16) -bor 8),[IntPtr]::Zero)
+    Check-Zoom 50
+    Command $w 204
+    Check-Zoom 100
+    Command $w 201
     Add-Type -AssemblyName System.Drawing.Common
     [void][MdSmoke]::GetWindowRect($w,[ref]$rect)
     $bitmap = [Drawing.Bitmap]::new($rect.right - $rect.left,$rect.bottom - $rect.top)
@@ -975,8 +1010,68 @@ Last source line Ω
     $sourcePoint = Text-Point $large $source $sourceAnchor[0]
     Assert ([Math]::Abs($viewPoint[1] - $viewAnchor[1]) -le 2 -and [Math]::Abs($sourcePoint[1] - $sourceAnchor[1]) -le 2) "live font changes retain both visible text anchors across reflow (view $($viewAnchor -join ',') -> $($viewPoint -join ','); source $($sourceAnchor -join ',') -> $($sourcePoint -join ','))"
     Assert (((Read-Selection $large $view) -join ',') -eq ($viewSelection -join ',') -and ((Read-Selection $large $source) -join ',') -eq ($sourceSelection -join ',') -and -not [MdSmoke]::Content($w).StartsWith('*')) 'large live fonts preserve both selections and clean state'
+    $viewAnchor = Read-Anchor $large $view
+    $sourceAnchor = Read-Anchor $large $source
+    $timer.Restart()
+    [void][MdSmoke]::Send($view,522,[IntPtr]((240 -shl 16) -bor 8),[IntPtr]::Zero)
+    $timer.Stop()
+    Write-Output "Large document zoom 100 -> 120 percent: $($timer.ElapsedMilliseconds) ms"
+    $viewPoint = Text-Point $large $view $viewAnchor[0]
+    $sourcePoint = Text-Point $large $source $sourceAnchor[0]
+    Assert ([Math]::Abs($viewPoint[1] - $viewAnchor[1]) -le 2 -and [Math]::Abs($sourcePoint[1] - $sourceAnchor[1]) -le 2) 'zoom preserves both visible text anchors'
+    Assert (((Read-Selection $large $view) -join ',') -eq ($viewSelection -join ',') -and ((Read-Selection $large $source) -join ',') -eq ($sourceSelection -join ',') -and -not [MdSmoke]::Content($w).StartsWith('*')) 'zoom preserves both selections and clean source'
     Navigate $large $w 'bold' 'bold' 3000 'beyond the 16-bit character range' 3000 2 2
     [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+    Assert ([IO.File]::ReadAllText($ini).Contains('zoom=120')) 'confirmed close flushes latest zoom'
+    $zoomApp = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
+    $processes.Add($zoomApp)
+    $zw = Wait-Window $zoomApp
+    $zs = [MdSmoke]::GetDlgItem($zw,300)
+    $zv = [MdSmoke]::GetDlgItem($zw,301)
+    $z = [MdSmoke]::Zoom($zoomApp.Id,$zv)
+    Assert ([Math]::Abs($z[0] / [double]$z[1] - 1.2) -lt 0.001) 'restart loads saved zoom'
+    $otherZoomApp = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru
+    $processes.Add($otherZoomApp)
+    $ow = Wait-Window $otherZoomApp
+    $os = [MdSmoke]::GetDlgItem($ow,300)
+    [void][MdSmoke]::Send($zv,522,[IntPtr]((120 -shl 16) -bor 8),[IntPtr]::Zero)
+    Wait-Setting { [IO.File]::ReadAllText($ini).Contains('zoom=130') } 'zoom debounce persists preference'
+    Start-Sleep -Milliseconds 300
+    $z = [MdSmoke]::Zoom($otherZoomApp.Id,$os)
+    Assert ([Math]::Abs($z[0] / [double]$z[1] - 1.2) -lt 0.001) 'already open window retains independent zoom on reload'
+    [void][MdSmoke]::Send($ow,16,[IntPtr]::Zero,[IntPtr]::Zero)
+    Assert ([IO.File]::ReadAllText($ini).Contains('zoom=130')) 'unchanged window close preserves newer preference'
+    [IO.File]::WriteAllText($ini,[IO.File]::ReadAllText($ini).Replace('zoom=130','zoom=90').Replace('edit=Arial','edit=Consolas'))
+    Wait-Setting { (Read-Font $zoomApp $zs) -eq 'Consolas' } 'font reload applies with independent active zoom'
+    Command $zw 203
+    $z = [MdSmoke]::Zoom($zoomApp.Id,$zv)
+    Assert ([Math]::Abs($z[0] / [double]$z[1] - 1.3) -lt 0.001) 'font, theme and saved zoom reload retain active zoom'
+    Command $zw 200
+    [void][MdSmoke]::Send($zs,177,[IntPtr]0,[IntPtr]0)
+    [void][MdSmoke]::Text($zs,194,[IntPtr]1,'zoom undo ')
+    [void][MdSmoke]::Send($zs,1227,[IntPtr]::Zero,[IntPtr]::Zero)
+    [void][MdSmoke]::Send($zs,522,[IntPtr]((120 -shl 16) -bor 8),[IntPtr]::Zero)
+    Assert ([MdSmoke]::Content($zw).StartsWith('*')) 'zoom retains dirty state'
+    [void][MdSmoke]::Send($zs,199,[IntPtr]::Zero,[IntPtr]::Zero)
+    Assert (-not [MdSmoke]::Content($zs).StartsWith('zoom undo ')) 'actual undo survives zoom'
+    [void][MdSmoke]::Send($zs,1108,[IntPtr]::Zero,[IntPtr]::Zero)
+    Assert ([MdSmoke]::Content($zs).StartsWith('zoom undo ')) 'actual redo survives zoom'
+    [void][MdSmoke]::Send($zs,199,[IntPtr]::Zero,[IntPtr]::Zero)
+    Command $zw 101
+    [void][MdSmoke]::Send($zw,16,[IntPtr]::Zero,[IntPtr]::Zero)
+    $tableZoomPath = Join-Path $testDirectory 'zoom-tables.md'
+    [IO.File]::WriteAllText($tableZoomPath, ("| Header | Amount |`n| --- | ---: |`n| A long formatted **cell** | 42 |`n`n" * 80))
+    $tableZoom = Start-Process -FilePath $exe -ArgumentList "`"$tableZoomPath`"" -WindowStyle Hidden -PassThru
+    $processes.Add($tableZoom)
+    $tw = Wait-Window $tableZoom
+    $tv = [MdSmoke]::GetDlgItem($tw,301)
+    Command $tw 204
+    $timer.Restart()
+    [void][MdSmoke]::Send($tv,522,[IntPtr]((120 -shl 16) -bor 8),[IntPtr]::Zero)
+    $timer.Stop()
+    Write-Output "80-table document zoom 100 -> 110 percent: $($timer.ElapsedMilliseconds) ms"
+    Navigate $tableZoom $tw 'cell' 'cell' 0 'after proportional zoom'
+    [void][MdSmoke]::Send($tw,16,[IntPtr]::Zero,[IntPtr]::Zero)
     Remove-Item -LiteralPath $ini
     Write-Output 'Smoke check complete. Physical mixed-DPI monitor movement and interactive keyboard/mouse use still need manual review.'
 }

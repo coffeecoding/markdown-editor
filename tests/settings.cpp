@@ -46,7 +46,7 @@ void ParserAndRepair()
 {
     DeleteFileW(path.c_str());
     auto settings = Read();
-    Check(settings.missing == 0xffff && !settings.invalid && settings.prose == L"Segoe UI", "missing uses normal defaults");
+    Check(settings.missing == 0x1ffff && !settings.invalid && settings.prose == L"Segoe UI", "missing uses normal defaults");
     Check(GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES, "read never populates missing file");
     Repair();
     settings = Read();
@@ -122,7 +122,7 @@ void ParserAndRepair()
     for (const auto& malformed : {L"[broken\ntext=#000000\n", L"[font]\nnot a setting\n", L"outside=section\n", L"[ ]\n"}) {
         Put(malformed, Encoding::Utf16Be);
         settings = Read();
-        Check(settings.invalid == 0xffff && settings.prose == L"Consolas" && settings.light.text == RGB(255, 105, 180), "malformed snapshot has global errors");
+        Check(settings.invalid == 0x1ffff && settings.prose == L"Consolas" && settings.light.text == RGB(255, 105, 180), "malformed snapshot has global errors");
         Repair();
         Check(!Read().invalid && !Read().missing, "malformed repair generates complete defaults");
         WIN32_FIND_DATAW found{};
@@ -134,6 +134,32 @@ void ParserAndRepair()
         FileFormat format;
         Check(ReadDocument(backup, bytes, format, message, true) && bytes == malformed && format.encoding == Encoding::Utf16Be, "backup preserves original encoding and content");
         DeleteFileW(backup.c_str());
+    }
+}
+
+void ZoomSettings()
+{
+    std::wstring error;
+    for (const auto& value : {L"", L"49", L"301", L"-100", L"100x", L"1.5", L"999999999999999999"}) {
+        Put(std::wstring(L"[appearance]\nzoom=") + value + L"\n");
+        Check(Read().zoomPercent == 100 && (Read().invalid & (1u << 16)), "invalid zoom defaults to 100");
+        Repair();
+        Check(Read().zoomPercent == 100 && !Read().invalid, "repair invalid zoom");
+    }
+    for (Encoding encoding : {Encoding::Utf8, Encoding::Utf8Bom, Encoding::Utf16Le, Encoding::Utf16Be}) {
+        const std::wstring original = L"; \u03a9\r\n[appearance]\nzoom = 50 \rtheme=dark\n[other]\r\nkeep=yes\n";
+        Put(original, encoding);
+        Check(Read().zoomPercent == 50, "minimum zoom accepted");
+        Check(SaveZoom(path, 300, error), "save maximum zoom");
+        FileFormat format;
+        auto expected = original;
+        expected.replace(expected.find(L"50"), 2, L"300");
+        Check(Text(&format) == expected && format.encoding == encoding && Read().zoomPercent == 300, "single field zoom write preserves encoding and mixed newlines");
+        HANDLE lock = CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        Check(lock != INVALID_HANDLE_VALUE, "lock zoom settings");
+        Check(!SaveZoom(path, 110, error), "zoom write failure reported");
+        CloseHandle(lock);
+        Check(Text() == expected, "failed zoom save retains original");
     }
 }
 
@@ -196,6 +222,7 @@ int wmain()
     path = std::wstring(directory) + L"\\settings-check.ini";
     try {
         ParserAndRepair();
+        ZoomSettings();
         Watcher();
         DeleteFileW(path.c_str());
         puts("Settings parser, repair, encodings, locks and asynchronous watcher checks passed.");

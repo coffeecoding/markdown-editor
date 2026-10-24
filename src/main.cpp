@@ -22,10 +22,10 @@ namespace {
 constexpr wchar_t WindowClass[] = L"NativeMarkdownEditorWindow";
 constexpr int OpenId = 100, SaveId = 101, ExitId = 102;
 constexpr int EditId = 200, ViewId = 201, ToggleId = 202;
-constexpr int DarkThemeId = 203;
+constexpr int DarkThemeId = 203, ResetZoomId = 204;
 constexpr int SourceId = 300, PreviewId = 301;
 constexpr UINT SettingsChanged = WM_APP + 1, SettingsFailure = WM_APP + 2;
-constexpr UINT_PTR SettingsTimer = 1;
+constexpr UINT_PTR SettingsTimer = 1, ZoomTimer = 2;
 constexpr LONG TextLimit = 32 * 1024 * 1024;
 // windows.h defines the standard EDIT message under the same name. Use Rich
 // Edit's full-width POINTL variant, which also works beyond 65,535 characters.
@@ -83,6 +83,9 @@ struct App {
     UINT settingsRetryDelay = 100;
     Settings settings;
     SettingsWatcher watcher;
+    // Active zoom belongs to this window; settings reloads only affect future windows.
+    int zoomPercent = 100, wheelRemainder = 0;
+    bool zoomPending = false, zoomFailureReported = false;
     UINT dpi = 96;
     UINT richEditBaseDpi = 96;
     std::wstring path, savedSource, iniPath;
@@ -148,6 +151,7 @@ struct App {
         iniPath = directory + L"markdown-editor.ini";
         DWORD code = 0;
         ReadSettings(iniPath, settings, code);
+        zoomPercent = settings.zoomPercent;
     }
 
     bool UpdateSettings(Settings next)
@@ -203,6 +207,7 @@ struct App {
         closing = true;
         KillTimer(window, SettingsTimer);
         watcher.Stop();
+        FlushZoom();
         std::wstring error;
         if (!RepairSettings(iniPath, error))
             Error(L"Settings could not be repaired. The original INI was retained.\n" + iniPath + L"\n\n" + error);
@@ -298,7 +303,7 @@ struct App {
             if (child == preview) {
                 RECT text{};
                 SendMessageW(child, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&text));
-                rendering.tableWidth = std::max<LONG>(1, MulDiv(text.right - text.left, 1440, dpi));
+                rendering.tableWidth = std::max<LONG>(1, MulDiv(text.right - text.left, 144000, dpi * zoomPercent));
             }
             InvalidateRect(child, nullptr, TRUE);
         }
@@ -319,12 +324,50 @@ struct App {
         InvalidateRect(window, nullptr, TRUE);
     }
 
+    void ApplyZoom(HWND control)
+    {
+        // Reduce the ratio to stay within Rich Edit's 16-bit operands.
+        unsigned numerator = dpi * zoomPercent, denominator = richEditBaseDpi * 100;
+        unsigned a = numerator, b = denominator;
+        while (b) { unsigned r = a % b; a = b; b = r; }
+        SendMessageW(control, EM_SETZOOM, numerator / a, denominator / a);
+    }
+
+    void FlushZoom()
+    {
+        KillTimer(window, ZoomTimer);
+        if (!zoomPending) return;
+        std::wstring error;
+        if (SaveZoom(iniPath, zoomPercent, error)) {
+            zoomPending = false;
+            zoomFailureReported = false;
+        } else if (!zoomFailureReported) {
+            zoomFailureReported = true;
+            Error(L"The zoom is active for this window, but could not be saved.\n" + iniPath + L"\n\n" + error);
+        }
+    }
+
+    void Zoom(int percent, bool reset = false)
+    {
+        if (reset) wheelRemainder = 0;
+        percent = std::clamp(percent, 50, 300);
+        if (percent == zoomPercent && !reset) return;
+        const auto sourcePosition = Remember(source), viewPosition = Remember(preview);
+        zoomPercent = percent;
+        for (HWND child : {source, preview}) ApplyZoom(child);
+        Layout();
+        Restore(source, sourcePosition, false);
+        Restore(preview, viewPosition, false);
+        zoomPending = true;
+        SetTimer(window, ZoomTimer, 300, nullptr);
+    }
+
     void Scale(UINT newDpi)
     {
         dpi = newDpi;
         // Rich Edit uses the screen DC's logical DPI for twips. Zoom supplies
         // the monitor ratio without rewriting text or touching undo history.
-        for (HWND child : {source, preview}) SendMessageW(child, EM_SETZOOM, dpi, richEditBaseDpi);
+        for (HWND child : {source, preview}) ApplyZoom(child);
         Layout();
     }
 
@@ -351,7 +394,7 @@ struct App {
         previewTables = std::move(rendered.tables);
         SendMessageW(preview, EM_EMPTYUNDOBUFFER, 0, 0);
         SendMessageW(preview, EM_SETMODIFY, FALSE, 0);
-        SendMessageW(preview, EM_SETZOOM, dpi, richEditBaseDpi);
+        ApplyZoom(preview);
         Restore(preview, position, !previewFontDirty);
         previewFontDirty = false;
         renderDirty = false;
@@ -543,9 +586,11 @@ LRESULT CALLBACK ControlProc(HWND control, UINT message, WPARAM wparam, LPARAM l
             return 0;
         }
     }
+    if (message == WM_KILLFOCUS || (message == WM_KEYUP && wparam == VK_CONTROL)) app.wheelRemainder = 0;
     if (message == WM_KEYDOWN) {
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (ctrl && wparam == '0') { app.Zoom(100, true); return 0; }
         if (ctrl && wparam == 'A') {
             CHARRANGE all{0, -1};
             SendMessageW(control, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&all));
@@ -573,7 +618,16 @@ LRESULT CALLBACK ControlProc(HWND control, UINT message, WPARAM wparam, LPARAM l
         return 0;
     }
     // Suppress Rich Edit's built-in formatting and zoom shortcuts.
-    if (message == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(wparam) & MK_CONTROL)) return 0;
+    if (message == WM_MOUSEWHEEL) {
+        if (GET_KEYSTATE_WPARAM(wparam) & MK_CONTROL) {
+            app.wheelRemainder += GET_WHEEL_DELTA_WPARAM(wparam);
+            const int steps = app.wheelRemainder / WHEEL_DELTA;
+            app.wheelRemainder %= WHEEL_DELTA;
+            if (steps) app.Zoom(app.zoomPercent + steps * 10);
+            return 0;
+        }
+        app.wheelRemainder = 0;
+    }
     if (message == WM_CHAR && (wparam == 1 || wparam == 22 || wparam == 25 || wparam == 26)) return 0;
     if (message == WM_CHAR && (GetKeyState(VK_CONTROL) & 0x8000) &&
         (wparam == 2 || wparam == 5 || wparam == 9 || wparam == 10 || wparam == 11 ||
@@ -672,6 +726,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         }
         return 0;
     case WM_TIMER:
+        if (wparam == ZoomTimer) { app->FlushZoom(); return 0; }
         if (wparam == SettingsTimer) {
             KillTimer(window, SettingsTimer);
             app->ReloadSettings();
@@ -713,6 +768,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         case ViewId: app->Mode(false); return 0;
         case ToggleId: app->Mode(!app->editMode); return 0;
         case DarkThemeId: app->ToggleTheme(); return 0;
+        case ResetZoomId: app->Zoom(100, true); return 0;
         }
         break;
     case WM_NOTIFY: {
@@ -743,7 +799,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         DeleteObject(brush);
         return 1;
     }
-    case WM_DESTROY: app->watcher.Stop(); KillTimer(window, SettingsTimer); PostQuitMessage(0); return 0;
+    case WM_DESTROY: app->watcher.Stop(); KillTimer(window, SettingsTimer); KillTimer(window, ZoomTimer); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(window, message, wparam, lparam);
 }
@@ -771,7 +827,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
         CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(900, dpi, 96), MulDiv(700, dpi, 96), nullptr, Menu(), instance, &app);
     if (!window) { MessageBoxW(nullptr, L"The editor window could not be created.", L"Markdown Editor", MB_OK | MB_ICONERROR); return 1; }
     ACCEL keys[]{{FVIRTKEY | FCONTROL, 'O', OpenId}, {FVIRTKEY | FCONTROL, 'S', SaveId},
-                 {FVIRTKEY | FCONTROL, 'T', ToggleId}, {FVIRTKEY, VK_ESCAPE, ViewId}};
+                 {FVIRTKEY | FCONTROL, '0', ResetZoomId}, {FVIRTKEY | FCONTROL, 'T', ToggleId}, {FVIRTKEY, VK_ESCAPE, ViewId}};
     HACCEL accelerators = CreateAcceleratorTableW(keys, ARRAYSIZE(keys));
     ShowWindow(window, show);
     UpdateWindow(window);

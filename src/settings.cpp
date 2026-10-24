@@ -7,14 +7,14 @@
 #include <vector>
 
 namespace {
-constexpr unsigned FieldCount = 16;
+constexpr unsigned FieldCount = 17;
 constexpr uint32_t AllFields = (1u << FieldCount) - 1;
 constexpr COLORREF BadBackground = RGB(139, 0, 0), BadForeground = RGB(255, 105, 180);
 const wchar_t* Sections[] = {L"appearance", L"font", L"font", L"font",
     L"theme.light", L"theme.light", L"theme.light", L"theme.light", L"theme.light", L"theme.light",
-    L"theme.dark", L"theme.dark", L"theme.dark", L"theme.dark", L"theme.dark", L"theme.dark"};
+    L"theme.dark", L"theme.dark", L"theme.dark", L"theme.dark", L"theme.dark", L"theme.dark", L"appearance"};
 const wchar_t* Keys[] = {L"theme", L"edit", L"prose", L"code", L"background", L"text", L"link",
-    L"muted", L"code", L"table_border", L"background", L"text", L"link", L"muted", L"code", L"table_border"};
+    L"muted", L"code", L"table_border", L"background", L"text", L"link", L"muted", L"code", L"table_border", L"zoom"};
 COLORREF ThemePalette::* const Colors[] = {&ThemePalette::background, &ThemePalette::text,
     &ThemePalette::link, &ThemePalette::muted, &ThemePalette::code, &ThemePalette::tableBorder};
 
@@ -134,7 +134,16 @@ bool Load(const std::wstring& path, Snapshot& snapshot, DWORD& ioError)
         if (snapshot.settings.missing & (1u << i)) continue;
         const auto& value = values[i];
         bool valid = true;
-        if (i == 0) {
+        if (i == 16) {
+            int percent = 0;
+            valid = !value.empty() && value.size() <= 3;
+            if (valid) for (wchar_t c : value) {
+                if (c < L'0' || c > L'9') { valid = false; break; }
+                percent = percent * 10 + c - L'0';
+            }
+            valid = valid && percent >= 50 && percent <= 300;
+            snapshot.settings.zoomPercent = valid ? percent : 100;
+        } else if (i == 0) {
             valid = Equal(value, L"light") || Equal(value, L"dark");
             snapshot.settings.dark = Equal(value, L"dark");
         } else if (i < 4) {
@@ -154,6 +163,7 @@ bool Load(const std::wstring& path, Snapshot& snapshot, DWORD& ioError)
 
 std::wstring Default(unsigned field)
 {
+    if (field == 16) return L"100";
     if (field == 0) return L"light";
     if (field < 4) return field == 2 ? L"Segoe UI" : L"Consolas";
     const COLORREF value = Palette(field >= 10).*Colors[(field - 4) % 6];
@@ -162,14 +172,14 @@ std::wstring Default(unsigned field)
     return text;
 }
 
-bool Write(const std::wstring& path, Snapshot& snapshot, uint32_t fields, bool dark, bool themeOnly, std::wstring& error)
+bool Write(const std::wstring& path, Snapshot& snapshot, uint32_t fields, bool dark, bool preferenceOnly, std::wstring& error, int zoom = 100)
 {
     struct Replacement { Location location; std::wstring value; };
     std::vector<Replacement> replacements;
     std::wstring appended, section;
     for (unsigned i = 0; i < FieldCount; ++i) {
         if (!(fields & (1u << i))) continue;
-        const std::wstring value = themeOnly ? (dark ? L"dark" : L"light") : Default(i);
+        const std::wstring value = preferenceOnly ? (i == 16 ? std::to_wstring(zoom) : (dark ? L"dark" : L"light")) : Default(i);
         if (snapshot.settings.missing & (1u << i)) {
             if (section != Sections[i]) {
                 section = Sections[i];
@@ -237,6 +247,18 @@ bool SaveTheme(const std::wstring& path, bool dark, std::wstring& error)
     if (snapshot.malformed) { error = L"The INI cannot be parsed. Correct it or close the editor to repair it."; return false; }
     if (!(snapshot.settings.missing & 1) && !(snapshot.settings.invalid & 1) && snapshot.settings.dark == dark) return true;
     return Write(path, snapshot, 1, dark, true, error);
+}
+
+bool SaveZoom(const std::wstring& path, int percent, std::wstring& error)
+{
+    if (percent < 50 || percent > 300) { error = L"Invalid zoom percentage."; return false; }
+    Snapshot snapshot;
+    DWORD code = 0;
+    if (!Load(path, snapshot, code)) { error = SystemError(code); return false; }
+    if (snapshot.malformed) { error = L"The INI cannot be parsed. Correct it or close the editor to repair it."; return false; }
+    constexpr uint32_t field = 1u << 16;
+    if (!((snapshot.settings.missing | snapshot.settings.invalid) & field) && snapshot.settings.zoomPercent == percent) return true;
+    return Write(path, snapshot, field, false, true, error, percent);
 }
 
 void CALLBACK SettingsWatcher::Callback(PTP_CALLBACK_INSTANCE, void* context, PTP_WAIT, TP_WAIT_RESULT)

@@ -1,6 +1,8 @@
 ; Copy to markdown-editor.ini beside markdown-editor.exe.
 ; Mode > Dark theme applies and saves theme changes immediately.
 [appearance]
+; Shared Edit/View zoom for new windows (50-300 percent).
+zoom=100
 theme=light
 
 ; Saved changes apply live after 150 ms. Use #RRGGBB (case-insensitive).

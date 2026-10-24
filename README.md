@@ -14,7 +14,7 @@ browser engine, extra runtime, installer, or startup network access.
 ## Run
 
 Copy `markdown-editor.exe` and `MD4C-LICENSE.txt` from [release/](release/) into
-a permanent folder. The required distribution is about **390 KiB**.
+a permanent folder. The required distribution is about **394 KiB**.
 
 The ivory quill icon is embedded in the executable for Explorer, the taskbar,
 Alt+Tab, and the title bar. Ten sizes from 16 to 256 pixels keep it clear at
@@ -36,6 +36,7 @@ the executable; the application does not change file associations itself.
 | Action                              | Shortcut                            |
 | ----------------------------------- | ----------------------------------- |
 | Open / Save                         | Ctrl+O / Ctrl+S                     |
+| Zoom / reset zoom                   | Ctrl+wheel / Ctrl+0                 |
 | Toggle Edit/View                    | Ctrl+T                              |
 | Leave Edit mode                     | Esc                                 |
 | Edit at the clicked source position | Double-click View without modifiers |
@@ -109,6 +110,14 @@ and changes made while a native dialog is open. Each window watches the same
 file without idle polling. Temporary sharing locks retain the current appearance
 and retry with a 100 ms to one-second backoff.
 
+Ctrl+wheel scales all document text proportionally in 10 percentage point steps,
+from 50–300%; Ctrl+0 restores 100% while retaining Windows DPI scaling. Edit and
+View share one zoom level per window, including when opening another document.
+The latest zoom is saved after 300 ms to `[appearance] zoom=100` for new windows
+and future launches. Existing windows keep their own zoom during settings reloads.
+Invalid or missing zoom values use 100%. Failed saves retain the active zoom and
+report once until a save succeeds. Confirmed close flushes pending zoom changes.
+
 The independent font settings are `[font] edit=Consolas`, `prose=Segoe UI`, and
 `code=Consolas`. Font sizes remain fixed. Family names are checked with Windows
 font enumeration; there is no private font loading. Both palettes keep their
@@ -133,7 +142,7 @@ or inline-comment syntax.
 
 Startup and reload never populate or repair the INI. After a confirmed close,
 the app rereads the latest file and atomically repairs missing or invalid theme,
-font, and palette settings to normal defaults, preserving valid choices,
+font, zoom, and palette settings to normal defaults, preserving valid choices,
 comments, unrelated entries, encoding/BOM, and existing line endings. A malformed
 file is first copied to a unique `markdown-editor.ini.invalid-*.bak` beside it,
 then replaced with complete defaults. Canceling close performs no repair. A
@@ -157,7 +166,7 @@ widest columns first and wrap cell text. Columns have an 18-point minimum. If
 those minimums cannot fit, the preview scrolls horizontally while surrounding
 prose stays wrapped. Partial rows are clipped at the viewport edges; vertical
 padding sits outside the native text window to avoid stale table text at the
-bottom while scrolling. Resizing and DPI changes reuse cached row positions and
+bottom while scrolling. Zoom, resizing, and DPI changes reuse cached row positions and
 preferred widths without reparsing or measuring again. Double-click navigation
 uses native cell and hidden row offsets; copying produces ordinary cell text.
 Tables beyond Rich Edit's [63-column limit](https://learn.microsoft.com/en-us/windows/win32/controls/em-settableparms)
@@ -171,6 +180,9 @@ about 8/14 ms with unchanged mapping memory. The table workload (80 tables,
 720 rows, 2,880 cells) takes about 166 ms to render, dominated by native formatted
 cell measurement, and 9 ms to resize from cached widths. Its retained table
 metadata occupies 8,640 bytes (9,424 allocated), in addition to source mapping.
+Zoom measured about 2–4 ms for both a 405,000-character document and an 80-table
+document, using cached layout without parsing or cell measurement. Renderer
+benchmarks remain about 8/14 ms with unchanged mapping and table metadata memory.
 These timings depend on fonts and hardware; run the benchmark for local results.
 
 ## Roadmap

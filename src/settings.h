@@ -5,6 +5,7 @@
 
 struct Settings {
     bool dark = false;
+    int zoomPercent = 100;
     ThemePalette light = Palette(false), night = Palette(true);
     std::wstring edit = L"Consolas", prose = L"Segoe UI", code = L"Consolas";
     uint32_t missing = 0, invalid = 0;
@@ -16,6 +17,7 @@ bool SamePalette(const ThemePalette& a, const ThemePalette& b);
 // Malformed snapshots return true with conspicuous effective error settings.
 bool ReadSettings(const std::wstring& path, Settings& settings, DWORD& ioError);
 bool RepairSettings(const std::wstring& path, std::wstring& error);
+bool SaveZoom(const std::wstring& path, int percent, std::wstring& error);
 bool SaveTheme(const std::wstring& path, bool dark, std::wstring& error);
 
 // All operations except Callback run on the window thread. The wait callback
