@@ -1,0 +1,5 @@
+; Copy to markdown-editor.ini beside markdown-editor.exe, then restart.
+; A relative path is resolved beside the executable. Do not add quotes.
+; Remove this setting (or the INI file) to restore the default fonts.
+[font]
+path=fonts\YourFont.ttf
