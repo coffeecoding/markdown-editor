@@ -75,6 +75,28 @@ Sources:
 - [RichEditD2D Window Controls](https://devblogs.microsoft.com/math-in-office/richeditd2d-window-controls/)
 - [Windows 11 Notepad](https://devblogs.microsoft.com/math-in-office/windows-11-notepad/)
 
+### How much the Notepad article establishes
+
+The [Windows 11 Notepad article](https://devblogs.microsoft.com/math-in-office/windows-11-notepad/)
+provides the key architectural clue, but is not a complete implementation guide
+for this editor. It explains that GDI cannot display color-font layers, that
+Notepad uses DirectWrite through `RichEditD2DPT`, and that its Rich Edit build
+differs from the system `Msftedit.dll` loaded here. Its discussion of classic
+font binding and emoji ZWJ sequences is also relevant to fallback and shaping.
+
+The article alone does not establish a supported, redistributable replacement
+that meets our under-1-MB, no-extra-runtime requirements. The windowless
+system-DLL candidate below remains a separate path to investigate; a drop-in
+window-class replacement has not been demonstrated.
+
+Before implementation, verify runtime availability, font fallback and joined
+emoji sequences, compatibility with tables and cell measurement, UTF-16 source
+mapping, zoom, selection/scroll restoration, and undo/redo. The current proposal
+starts with View; improved Edit rendering would need its own verification while
+preserving the live source control. Existing Unicode storage support should not
+be confused with verified full-color presentation. Implementation remains
+postponed; these notes record research rather than a working prototype.
+
 ### Windowless Rich Edit with Direct2D
 
 The documented candidate is a native text-services object hosted by our own
