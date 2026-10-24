@@ -17,7 +17,7 @@ target_compile_features(markdown-editor PRIVATE cxx_std_17)
 target_compile_definitions(markdown-editor PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN
     NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(markdown-editor PRIVATE third_party/md4c)
-target_link_libraries(markdown-editor PRIVATE comctl32 comdlg32 shell32 gdiplus)
+target_link_libraries(markdown-editor PRIVATE comctl32 comdlg32 shell32 gdiplus dwmapi)
 set_property(TARGET markdown-editor PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 target_compile_options(markdown-editor PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4> /utf-8 $<$<CONFIG:Release>:/GL>)
 target_link_options(markdown-editor PRIVATE $<$<CONFIG:Release>:/LTCG>

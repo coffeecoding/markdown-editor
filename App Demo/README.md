@@ -52,8 +52,9 @@ and the static MSVC runtime (`/MT`). It embeds its manifest and targets x64.
 
 ## Controls
 
-The native menu bar contains exactly File → Open…, Save, Exit and Mode → Edit,
-View. The active mode has a radio check. The title shows the filename (or
+The native menu bar contains File → Open…, Save, Exit and Mode → Edit,
+View, followed by a separator and Dark theme. The active mode has a radio check.
+Dark theme has an independent check. The title shows the filename (or
 Untitled), with `*` for unsaved changes. The document fills the client area.
 
 | Action | Shortcut |
@@ -84,6 +85,42 @@ change. The source control stays alive, including its selection, scrolling, and
 up to 1,000 undo actions. Each mode retains its own selection and scroll state.
 After rerendering, View restores its previous character offsets and approximate
 scroll position; it does not map positions semantically between source and View.
+
+## Light and dark themes
+
+Choose **Mode → Dark theme** to switch immediately; unchecked means Light.
+Both document modes share these colors:
+
+| Color | Light | Dark |
+| --- | --- | --- |
+| Document background | `#F5F3EE` | `#000000` |
+| Main text | `#242424` | `#D0D0D0` |
+| Links | `#005BAE` | `#79B8FF` |
+| Quotes and rules | `#62605C` | `#A0A0A0` |
+| Code background | `#E8E5DE` | `#181818` |
+
+The app requests a matching native title bar where Windows supports it. Menus,
+context menus, selection highlighting, and common dialogs keep Windows-managed
+appearance. Custom document fonts and DPI scaling continue to apply.
+
+The choice is saved immediately beside the executable in `markdown-editor.ini`,
+preserving existing font settings:
+
+```ini
+[appearance]
+theme=dark
+```
+
+Missing or invalid values default to Light. If the preference cannot be written,
+the selected theme stays active for this session and an error identifies the
+configuration path. The executable's directory must be writable to retain the
+choice across launches.
+
+Switching preserves source text, undo/redo, unsaved state, selection, and scroll
+position. View regenerates once and restores its selection and approximate
+scroll position. In Edit mode, regeneration waits until View is entered. There
+is no polling or background theme work; large documents may pause during a
+View refresh.
 
 ## Files and unsaved work
 
@@ -188,14 +225,14 @@ Ninja on Windows x64. Release build completed without warnings.
 
 | Required shipped file | Bytes |
 | --- | ---: |
-| `markdown-editor.exe` | 290,304 |
+| `markdown-editor.exe` | 292,352 |
 | `MD4C-LICENSE.txt` | 1,096 |
-| **Total: 2 files** | **291,400 (284.57 KiB)** |
+| **Total: 2 files** | **293,448 (286.57 KiB)** |
 
 Only Windows DLLs are imported; Rich Edit is loaded from Windows System32.
 No VC runtime redistribution is needed. Optional configuration, user fonts,
 source, documentation, sample files, and build artifacts are excluded from the
-required distribution total. The first build is well below the 2 MB target;
+required distribution total. The build remains well below the 2 MB target;
 no iterative size tuning or startup benchmarking was done.
 
 Run the brief native integration smoke check after building:
@@ -213,6 +250,23 @@ completion, Cancel/Discard, failure-safe saving against a locked file, UTF-8 and
 both UTF-16 BOM encodings, and LF/CRLF retention. It checks a configured Arial
 TTF in both controls and graceful fallback for a missing file. The prior
 clipboard text is restored when present.
+
+The theme update adds 2,048 bytes to the executable (now 285.5 KiB), with no
+bundled dependency added. The extended smoke check passed both palettes for
+source, headings/body, links including detected URLs, quotes/rules, and inline
+and block code. It checks document backgrounds through the native control API,
+custom fonts, 96/144/192 DPI handlers, clean/dirty state, undo/redo across repeated
+switches, selections, clipboard copying, and nonzero scrolling in both controls.
+It also checks missing/invalid preferences, startup persistence, preservation of
+UTF-16 INI font settings/comments, and a locked configuration file producing an
+error while keeping the session's theme active.
+
+In a local hidden-window run, an ordinary document's palette checks plus four
+switches took 39 ms; one View switch for a 405,000-character document took 45 ms.
+These are one-run observations, not benchmark guarantees. Desktop capture in
+this execution session returned blank images, so the theme update's visual
+appearance, native title bar, physical mixed-monitor behavior, and interactive
+keyboard/mouse use still need manual review.
 
 The context-menu update was also checked through native popup menus: Edit's
 Copy/Cut/Paste, disabled Copy/Cut without a selection, Unicode clipboard text,

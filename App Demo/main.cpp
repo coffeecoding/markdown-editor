@@ -3,6 +3,9 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <richedit.h>
+#include <richole.h>
+#include <tom.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <gdiplus.h>
 #include "document.h"
@@ -17,6 +20,7 @@ namespace {
 constexpr wchar_t WindowClass[] = L"NativeMarkdownEditorWindow";
 constexpr int OpenId = 100, SaveId = 101, ExitId = 102;
 constexpr int EditId = 200, ViewId = 201, ToggleId = 202;
+constexpr int DarkThemeId = 203;
 constexpr int SourceId = 300, PreviewId = 301;
 constexpr LONG TextLimit = 32 * 1024 * 1024;
 
@@ -49,9 +53,10 @@ struct App {
     HINSTANCE instance{};
     HWND window{}, source{}, preview{};
     bool editMode = true, dirty = false, renderDirty = true, loading = false;
+    bool darkTheme = false;
     UINT dpi = 96;
     UINT richEditBaseDpi = 96;
-    std::wstring path, savedSource, privateFontPath, customFamily;
+    std::wstring path, savedSource, privateFontPath, customFamily, iniPath;
     FileFormat format;
     RenderOptions rendering;
 
@@ -80,15 +85,19 @@ struct App {
         SetWindowTextW(window, ((dirty ? L"*" : L"") + filename + L" — Markdown Editor").c_str());
     }
 
-    void LoadFont()
+    void LoadSettings()
     {
         std::vector<wchar_t> module(32768);
         GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size()));
         std::wstring directory(module.data());
         directory.resize(directory.find_last_of(L"\\/") + 1);
-        const auto ini = directory + L"markdown-editor.ini";
+        iniPath = directory + L"markdown-editor.ini";
+        wchar_t theme[32]{};
+        GetPrivateProfileStringW(L"appearance", L"theme", L"light", theme, ARRAYSIZE(theme), iniPath.c_str());
+        darkTheme = _wcsicmp(theme, L"dark") == 0;
+        rendering.palette = Palette(darkTheme);
         wchar_t configured[32768]{};
-        GetPrivateProfileStringW(L"font", L"path", L"", configured, ARRAYSIZE(configured), ini.c_str());
+        GetPrivateProfileStringW(L"font", L"path", L"", configured, ARRAYSIZE(configured), iniPath.c_str());
         std::wstring file(configured);
         if (file.empty()) return;
         if (!(file.size() >= 2 && file[1] == L':') && file[0] != L'\\' && file[0] != L'/') file = directory + file;
@@ -113,6 +122,60 @@ struct App {
             }
         }
         Gdiplus::GdiplusShutdown(token);
+    }
+
+    bool ApplyTheme()
+    {
+        // TOM suspends recording without discarding either undo or redo history.
+        IRichEditOle* ole = nullptr;
+        ITextDocument* document = nullptr;
+        SendMessageW(source, EM_GETOLEINTERFACE, 0, reinterpret_cast<LPARAM>(&ole));
+        if (ole) {
+            ole->QueryInterface(__uuidof(ITextDocument), reinterpret_cast<void**>(&document));
+            ole->Release();
+        }
+        if (!document) { Error(L"Windows could not change the document theme."); return false; }
+        const HRESULT suspended = document->Undo(tomSuspend, nullptr);
+        if (FAILED(suspended)) { document->Release(); Error(L"Windows could not preserve undo history while changing the theme."); return false; }
+        const auto position = Remember(source);
+        const LRESULT modified = SendMessageW(source, EM_GETMODIFY, 0, 0);
+        const LRESULT events = SendMessageW(source, EM_SETEVENTMASK, 0, 0);
+        // WM_SETREDRAW(TRUE) also sets WS_VISIBLE; never send it to the hidden source.
+        if (editMode) SendMessageW(source, WM_SETREDRAW, FALSE, 0);
+        rendering.palette = Palette(darkTheme);
+        CHARFORMAT2W colors{};
+        colors.cbSize = sizeof(colors);
+        colors.dwMask = CFM_COLOR;
+        colors.crTextColor = rendering.palette.text;
+        SendMessageW(source, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&colors));
+        SendMessageW(source, EM_SETBKGNDCOLOR, 0, rendering.palette.background);
+        SendMessageW(preview, EM_SETBKGNDCOLOR, 0, rendering.palette.background);
+        Restore(source, position);
+        SendMessageW(source, EM_SETMODIFY, modified, 0);
+        SendMessageW(source, EM_SETEVENTMASK, 0, events);
+        document->Undo(tomResume, nullptr);
+        document->Release();
+        if (editMode) SendMessageW(source, WM_SETREDRAW, TRUE, 0);
+        // Best effort: older Windows versions may reject either attribute.
+        const BOOL dark = darkTheme;
+        if (FAILED(DwmSetWindowAttribute(window, 20, &dark, sizeof(dark))))
+            DwmSetWindowAttribute(window, 19, &dark, sizeof(dark));
+        CheckMenuItem(GetMenu(window), DarkThemeId, MF_BYCOMMAND | (darkTheme ? MF_CHECKED : MF_UNCHECKED));
+        renderDirty = true;
+        if (!editMode) Render();
+        for (HWND child : {source, preview}) InvalidateRect(child, nullptr, TRUE);
+        return true;
+    }
+
+    void ToggleTheme()
+    {
+        darkTheme = !darkTheme;
+        if (!ApplyTheme()) { darkTheme = !darkTheme; return; }
+        if (!WritePrivateProfileStringW(L"appearance", L"theme", darkTheme ? L"dark" : L"light", iniPath.c_str())) {
+            const DWORD code = GetLastError();
+            Error(L"The theme is active for this session, but could not be saved to:\n" + iniPath +
+                  L"\n\n" + SystemError(code));
+        }
     }
 
     void Layout()
@@ -368,6 +431,8 @@ HMENU Menu()
     AppendMenuW(file, MF_STRING, ExitId, L"E&xit\tAlt+F4");
     AppendMenuW(mode, MF_STRING | MF_CHECKED, EditId, L"&Edit\tCtrl+1");
     AppendMenuW(mode, MF_STRING, ViewId, L"&View\tCtrl+2");
+    AppendMenuW(mode, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(mode, MF_STRING, DarkThemeId, L"&Dark theme");
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"&File");
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(mode), L"&Mode");
     return bar;
@@ -399,7 +464,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         SendMessageW(app->source, EM_SETEVENTMASK, 0, ENM_CHANGE);
         for (HWND child : {app->source, app->preview}) {
             SendMessageW(child, EM_EXLIMITTEXT, 0, TextLimit);
-            SendMessageW(child, EM_SETBKGNDCOLOR, 0, RGB(255, 255, 255));
             // Plain-text paste and no rich objects, drag/drop, or embedded links
             // that could fetch content while a file is merely being opened.
             SetWindowSubclass(child, ControlProc, 1, reinterpret_cast<DWORD_PTR>(app));
@@ -408,12 +472,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         font.cbSize = sizeof(font);
         font.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR | CFM_CHARSET;
         font.yHeight = 12 * 20;
-        font.crTextColor = RGB(32, 32, 32);
+        font.crTextColor = app->rendering.palette.text;
         font.bCharSet = DEFAULT_CHARSET;
         wcscpy_s(font.szFaceName, app->customFamily.empty() ? L"Consolas" : app->customFamily.c_str());
         SendMessageW(app->source, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&font));
         SendMessageW(app->preview, EM_AUTOURLDETECT, AURL_ENABLEURL | AURL_ENABLEEMAILADDR, 0);
         SendMessageW(app->preview, EM_SETEVENTMASK, 0, ENM_LINK);
+        if (!app->ApplyTheme()) return -1;
         app->Scale(app->dpi);
         return 0;
     }
@@ -450,6 +515,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         case EditId: app->Mode(true); return 0;
         case ViewId: app->Mode(false); return 0;
         case ToggleId: app->Mode(!app->editMode); return 0;
+        case DarkThemeId: app->ToggleTheme(); return 0;
         }
         break;
     case WM_NOTIFY: {
@@ -487,7 +553,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     InitCommonControlsEx(&controls);
     App app;
     app.instance = instance;
-    app.LoadFont();
+    app.LoadSettings();
     WNDCLASSW cls{};
     cls.lpfnWndProc = WindowProc;
     cls.hInstance = instance;

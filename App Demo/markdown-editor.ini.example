@@ -1,4 +1,9 @@
-; Copy to markdown-editor.ini beside markdown-editor.exe, then restart.
+; Copy to markdown-editor.ini beside markdown-editor.exe.
+; Mode > Dark theme applies and saves theme changes immediately.
+[appearance]
+theme=light
+
+; Restart after changing the font setting.
 ; A relative path is resolved beside the executable. Do not add quotes.
 ; Remove this setting (or the INI file) to restore the default fonts.
 [font]

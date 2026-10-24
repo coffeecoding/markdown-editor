@@ -192,8 +192,11 @@ bool RenderMarkdown(const std::wstring& source, const RenderOptions& options, st
     Escape(renderer.out, options.bodyFont);
     renderer.out += ";}{\\f1\\fmodern ";
     Escape(renderer.out, options.codeFont);
-    renderer.out += ";}}{\\colortbl;\\red32\\green32\\blue32;\\red0\\green91\\blue174;"
-                    "\\red96\\green96\\blue96;\\red241\\green241\\blue241;}\\viewkind4 ";
+    renderer.out += ";}}{\\colortbl;";
+    for (COLORREF color : {options.palette.text, options.palette.link, options.palette.muted, options.palette.code})
+        renderer.out += "\\red" + std::to_string(GetRValue(color)) + "\\green" +
+            std::to_string(GetGValue(color)) + "\\blue" + std::to_string(GetBValue(color)) + ";";
+    renderer.out += "}\\viewkind4\\cf1 ";
     MD_PARSER parser{}; // flags == 0 selects MD4C's CommonMark dialect.
     parser.enter_block = [](MD_BLOCKTYPE type, void* detail, void* data) { return static_cast<Renderer*>(data)->EnterBlock(type, detail); };
     parser.leave_block = [](MD_BLOCKTYPE type, void*, void* data) { return static_cast<Renderer*>(data)->LeaveBlock(type); };
