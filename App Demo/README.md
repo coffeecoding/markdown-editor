@@ -73,8 +73,11 @@ View is a separate, wrapped, read-only Rich Edit control: mouse selection,
 Shift+arrow selection, Select All, and copying are available, with no insertion
 caret. Its visible URL destinations can be Ctrl+clicked for HTTP(S) and mailto
 links. Other destinations remain readable and copyable. No URLs are opened
-automatically. Native formatting and zoom shortcuts and the Rich Edit context
-menu are disabled to keep the document controls simple.
+automatically. Right-click (or Shift+F10 / the Menu key) opens a native context
+menu: Copy, Cut, and Paste in Edit mode, and Copy in View mode. Copy/Cut are
+disabled without a selection; Paste is disabled when no compatible text is
+available. Pasting inserts plain text and supports undo. Native formatting and
+zoom shortcuts remain disabled.
 
 Rendering occurs on opening a document and on entering View after a source
 change. The source control stays alive, including its selection, scrolling, and
@@ -178,16 +181,16 @@ You can also use **Settings → Apps → Default apps**, search for `.md`, and s
 the editor. See Microsoft's [default-app instructions](https://support.microsoft.com/en-us/windows/apps/change-default-apps-in-windows).
 The app does not edit registry associations or change defaults itself.
 
-## Delivery and verification — 23 October 2026
+## Delivery and verification — 24 October 2026
 
 Built with MSVC 19.51 (Visual Studio 2026), Windows SDK 10.0.26100.0, CMake and
 Ninja on Windows x64. Release build completed without warnings.
 
 | Required shipped file | Bytes |
 | --- | ---: |
-| `markdown-editor.exe` | 289,280 |
+| `markdown-editor.exe` | 290,304 |
 | `MD4C-LICENSE.txt` | 1,096 |
-| **Total: 2 files** | **290,376 (283.57 KiB)** |
+| **Total: 2 files** | **291,400 (284.57 KiB)** |
 
 Only Windows DLLs are imported; Rich Edit is loaded from Windows System32.
 No VC runtime redistribution is needed. Optional configuration, user fonts,
@@ -210,6 +213,10 @@ completion, Cancel/Discard, failure-safe saving against a locked file, UTF-8 and
 both UTF-16 BOM encodings, and LF/CRLF retention. It checks a configured Arial
 TTF in both controls and graceful fallback for a missing file. The prior
 clipboard text is restored when present.
+
+The context-menu update was also checked through native popup menus: Edit's
+Copy/Cut/Paste, disabled Copy/Cut without a selection, Unicode clipboard text,
+undo after Cut/Paste, and View's Copy-only menu all passed.
 
 The check also confirmed the window's actual PMv2 awareness and exercised the
 DPI handler at 96/144/192 DPI via synthetic messages on this 144-DPI session.

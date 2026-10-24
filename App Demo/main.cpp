@@ -276,6 +276,45 @@ struct App {
     }
 };
 
+void ClipboardMenu(HWND control, bool readOnly, LPARAM location)
+{
+    constexpr UINT Copy = 1, Cut = 2, Paste = 3;
+    CHARRANGE selection{};
+    SendMessageW(control, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const bool selected = selection.cpMin != selection.cpMax;
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING | (selected ? MF_ENABLED : MF_GRAYED), Copy, L"&Copy\tCtrl+C");
+    if (!readOnly) {
+        AppendMenuW(menu, MF_STRING | (selected ? MF_ENABLED : MF_GRAYED), Cut, L"Cu&t\tCtrl+X");
+        const bool canPaste = SendMessageW(control, EM_CANPASTE, CF_UNICODETEXT, 0) != 0;
+        AppendMenuW(menu, MF_STRING | (canPaste ? MF_ENABLED : MF_GRAYED), Paste, L"&Paste\tCtrl+V");
+    }
+
+    POINT point{GET_X_LPARAM(location), GET_Y_LPARAM(location)};
+    if (point.x == -1 && point.y == -1) {
+        // Shift+F10 / Menu key: anchor near the selection, within the viewport.
+        SendMessageW(control, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&point), selection.cpMax);
+        RECT client{};
+        GetClientRect(control, &client);
+        point.x = std::clamp<LONG>(point.x, 0, std::max<LONG>(0, client.right - 1));
+        point.y = std::clamp<LONG>(point.y + MulDiv(20, GetDpiForWindow(control), 96),
+                                   0, std::max<LONG>(0, client.bottom - 1));
+        ClientToScreen(control, &point);
+    }
+    SetFocus(control);
+    if (readOnly) HideCaret(control);
+    const UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        point.x, point.y, GetAncestor(control, GA_ROOT), nullptr);
+    DestroyMenu(menu);
+    switch (command) {
+    case Copy: SendMessageW(control, WM_COPY, 0, 0); break;
+    case Cut: SendMessageW(control, WM_CUT, 0, 0); break;
+    case Paste: SendMessageW(control, EM_PASTESPECIAL, CF_UNICODETEXT, 0); break;
+    }
+    if (readOnly) HideCaret(control);
+}
+
 LRESULT CALLBACK ControlProc(HWND control, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR, DWORD_PTR data)
 {
     auto& app = *reinterpret_cast<App*>(data);
@@ -305,9 +344,11 @@ LRESULT CALLBACK ControlProc(HWND control, UINT message, WPARAM wparam, LPARAM l
                      wparam == 'T' || wparam == VK_OEM_PLUS || wparam == VK_OEM_MINUS ||
                      (shift && (wparam == VK_OEM_COMMA || wparam == VK_OEM_PERIOD)))) return 0;
     }
-    // Suppress Rich Edit's built-in formatting, zoom, and RTF/OLE menu.
-    // Clipboard/undo remain available through the normal keyboard shortcuts.
-    if (message == WM_CONTEXTMENU) return 0;
+    if (message == WM_CONTEXTMENU) {
+        ClipboardMenu(control, view, lparam);
+        return 0;
+    }
+    // Suppress Rich Edit's built-in formatting and zoom shortcuts.
     if (message == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(wparam) & MK_CONTROL)) return 0;
     if (message == WM_CHAR && (wparam == 1 || wparam == 22 || wparam == 25 || wparam == 26)) return 0;
     if (message == WM_CHAR && (GetKeyState(VK_CONTROL) & 0x8000) &&
