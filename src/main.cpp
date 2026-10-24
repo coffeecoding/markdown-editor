@@ -517,8 +517,8 @@ HMENU Menu()
     AppendMenuW(file, MF_STRING, OpenId, L"&Open…\tCtrl+O");
     AppendMenuW(file, MF_STRING, SaveId, L"&Save\tCtrl+S");
     AppendMenuW(file, MF_STRING, ExitId, L"E&xit\tAlt+F4");
-    AppendMenuW(mode, MF_STRING | MF_CHECKED, EditId, L"&Edit\tCtrl+1");
-    AppendMenuW(mode, MF_STRING, ViewId, L"&View\tCtrl+2");
+    AppendMenuW(mode, MF_STRING | MF_CHECKED, EditId, L"&Edit\tCtrl+T");
+    AppendMenuW(mode, MF_STRING, ViewId, L"&View\tCtrl+T / Esc");
     AppendMenuW(mode, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(mode, MF_STRING, DarkThemeId, L"&Dark theme");
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"&File");
@@ -654,8 +654,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
         CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(900, dpi, 96), MulDiv(700, dpi, 96), nullptr, Menu(), instance, &app);
     if (!window) { MessageBoxW(nullptr, L"The editor window could not be created.", L"Markdown Editor", MB_OK | MB_ICONERROR); return 1; }
     ACCEL keys[]{{FVIRTKEY | FCONTROL, 'O', OpenId}, {FVIRTKEY | FCONTROL, 'S', SaveId},
-                 {FVIRTKEY | FCONTROL, '1', EditId}, {FVIRTKEY | FCONTROL, '2', ViewId},
-                 {FVIRTKEY | FCONTROL, VK_TAB, ToggleId}};
+                 {FVIRTKEY | FCONTROL, 'T', ToggleId}, {FVIRTKEY, VK_ESCAPE, ViewId}};
     HACCEL accelerators = CreateAcceleratorTableW(keys, ARRAYSIZE(keys));
     ShowWindow(window, show);
     UpdateWindow(window);

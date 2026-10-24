@@ -265,9 +265,14 @@ try {
     Command $w 203
     Assert ((Control-State $process $source) -eq $positionBefore -and [MdSmoke]::Content($source) -eq $sourceBefore -and [MdSmoke]::Content($w).StartsWith('*')) 'theme preserves unsaved text, source selection and scrolling'
     Assert ([MdSmoke]::Content($view) -eq $viewBefore) 'Edit theme change defers hidden preview rendering'
-    Command $w 201
-    Assert ([MdSmoke]::Content($view).Contains('Added source Ω')) 'entering View after editing rerenders'
+    # Queue a key message so the application's accelerator table handles it.
+    [void][MdSmoke]::PostMessage($source,256,[IntPtr]27,[IntPtr]1) # WM_KEYDOWN, VK_ESCAPE
+    for ($n=0; $n -lt 100 -and ([MdSmoke]::GetMenuState($mode,201,0) -band 8) -eq 0; ++$n) { Start-Sleep -Milliseconds 20 }
+    Assert (([MdSmoke]::GetMenuState($mode,201,0) -band 8) -ne 0 -and ([MdSmoke]::GetWindowLongPtrW($source,-16) -band 0x10000000) -eq 0 -and ([MdSmoke]::GetWindowLongPtrW($view,-16) -band 0x10000000) -ne 0) 'Esc leaves Edit for View'
+    Assert ([MdSmoke]::Content($view).Contains('Added source Ω')) 'Esc rerenders the edited preview'
+    Assert ([MdSmoke]::Content($source) -eq $sourceBefore -and [MdSmoke]::Content($w).StartsWith('*')) 'Esc preserves unsaved source and dirty state'
     Command $w 200
+    Assert ((Control-State $process $source) -eq $positionBefore) 'returning to Edit after Esc preserves source selection and scrolling'
     [void][MdSmoke]::Send($source, 199, [IntPtr]::Zero, [IntPtr]::Zero)
     Assert (-not [MdSmoke]::Content($source).Contains('Added source Ω')) 'undo history survives mode switches'
     Command $w 203

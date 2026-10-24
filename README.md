@@ -30,8 +30,8 @@ the executable; the application does not change file associations itself.
 | Action                              | Shortcut                            |
 | ----------------------------------- | ----------------------------------- |
 | Open / Save                         | Ctrl+O / Ctrl+S                     |
-| Edit / View                         | Ctrl+1 / Ctrl+2                     |
-| Toggle Edit/View                    | Ctrl+Tab                            |
+| Toggle Edit/View                    | Ctrl+T                              |
+| Leave Edit mode                     | Esc                                 |
 | Edit at the clicked source position | Double-click View without modifiers |
 | Undo / Redo in Edit                 | Ctrl+Z / Ctrl+Y or Ctrl+Shift+Z     |
 | Select all / Copy                   | Ctrl+A / Ctrl+C                     |
@@ -103,7 +103,7 @@ unsupported; code is not syntax-highlighted.
 - [ ] Emoji support
 - [ ] Recent files
 - [ ] Status bar
-- [ ] Esc to leave Edit mode
 - [ ] Application icon
 - [ ] Application license
 - [ ] Build pipeline and GitHub releases
+- [ ] Configurable line height in edit-mode
