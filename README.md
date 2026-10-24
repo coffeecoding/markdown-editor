@@ -1,5 +1,7 @@
 # Native Markdown Editor
 
+<img src="src/app-icon.svg" width="64" height="64" alt="An ivory quill on deep teal">
+
 A small, portable Markdown editor for Windows x64, built with C++17 and native
 Win32 controls. Edit the Markdown source or read a formatted preview, without a
 browser engine, extra runtime, installer, or startup network access.
@@ -12,7 +14,11 @@ browser engine, extra runtime, installer, or startup network access.
 ## Run
 
 Copy `markdown-editor.exe` and `MD4C-LICENSE.txt` from [release/](release/) into
-a permanent folder. The required distribution is about **337 KiB**.
+a permanent folder. The required distribution is about **366 KiB**.
+
+The ivory quill icon is embedded in the executable for Explorer, the taskbar,
+Alt+Tab, and the title bar. Ten sizes from 16 to 256 pixels keep it clear at
+different display scales; window icons reload at the monitor's DPI.
 
 From repository-root PowerShell:
 
@@ -67,6 +73,11 @@ cmake --build build/Release
 Application code is in `src/`, native checks in `tests/`, and the vendored
 [MD4C parser](third_party/md4c/LICENSE.md) in `third_party/md4c/`.
 
+The original icon artwork is [an editable SVG](src/app-icon.svg). After editing
+it, run `& '.\tools\make-icon.ps1'` to regenerate `src/app.ico`, then rebuild.
+This optional tool uses PowerShell and Windows System.Drawing, without packages;
+normal builds use the checked-in ICO and require no artwork tools.
+
 ## Verify
 
 ```powershell
@@ -78,7 +89,8 @@ The renderer checks rebuild Release; `-Benchmark` also reports mapping and table
 layout memory, render timings, native cell measurement, and cached table resizing.
 The smoke suite exercises native windows, file handling, themes, undo/redo,
 Unicode, tables, DPI handlers, and exact source navigation. Generated
-files stay under ignored `build/`. Physical mouse interaction, visible caret
+files stay under ignored `build/`. Icon extraction and DPI-specific window icon
+sizes are checked too. Physical mouse interaction, visible caret and shell icon
 appearance, and real mixed-monitor movement still need manual checks.
 Viewport checks also cover outer padding when scrolling tables, resizing, and
 showing or hiding the horizontal scrollbar.
@@ -133,7 +145,7 @@ These timings depend on fonts and hardware; run the benchmark for local results.
 - [ ] Emoji support
 - [ ] Recent files
 - [ ] Status bar
-- [ ] Application icon
+- [x] Application icon
 - [ ] Application license
 - [ ] Build pipeline and GitHub releases
 - [ ] Configurable line height in edit-mode

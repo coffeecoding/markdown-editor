@@ -28,6 +28,20 @@ public static class MdSmoke {
     [DllImport("user32.dll")] public static extern IntPtr GetWindowDpiAwarenessContext(IntPtr w);
     [DllImport("user32.dll")] public static extern bool AreDpiAwarenessContextsEqual(IntPtr a, IntPtr b);
     [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr w);
+    [DllImport("user32.dll")] public static extern int GetSystemMetricsForDpi(int metric, uint dpi);
+    [DllImport("shell32.dll",CharSet=CharSet.Unicode)] public static extern uint ExtractIconEx(string path,int index,out IntPtr large,out IntPtr small,uint count);
+    [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr icon);
+    [StructLayout(LayoutKind.Sequential)] public struct IconInfo { public bool icon; public uint x,y; public IntPtr mask,color; }
+    [StructLayout(LayoutKind.Sequential)] public struct BitmapInfo { public int type,width,height,stride; public ushort planes,bits; public IntPtr data; }
+    [DllImport("user32.dll")] public static extern bool GetIconInfo(IntPtr icon,out IconInfo info);
+    [DllImport("gdi32.dll",EntryPoint="GetObjectW")] public static extern int GetBitmap(IntPtr bitmap,int size,out BitmapInfo info);
+    [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr obj);
+    public static int[] IconSize(IntPtr icon) {
+        IconInfo info;if(icon==IntPtr.Zero||!GetIconInfo(icon,out info))return new[]{0,0};
+        try {BitmapInfo b;return GetBitmap(info.color,Marshal.SizeOf(typeof(BitmapInfo)),out b)==0?new[]{0,0}:new[]{b.width,b.height};}
+        finally {if(info.mask!=IntPtr.Zero)DeleteObject(info.mask);if(info.color!=IntPtr.Zero)DeleteObject(info.color);}
+    }
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);
     public static uint SystemDpi() {var old=SetThreadDpiAwarenessContext((IntPtr)(-4));try{return GetDpiForSystem();}finally{SetThreadDpiAwarenessContext(old);}}
     [StructLayout(LayoutKind.Sequential)] public struct Rect { public int left,top,right,bottom; }
@@ -159,6 +173,16 @@ function Check-Background($control, [int]$expected, [string]$name) {
     $actual = [MdSmoke]::Send($control,1091,[IntPtr]::Zero,[IntPtr]$expected).ToInt64()
     Assert ($actual -eq $expected) "$name document background"
 }
+function Check-Icons($w, [int]$dpi) {
+    foreach ($type in @(0,1)) {
+        $icon = [MdSmoke]::Send($w,127,[IntPtr]$type,[IntPtr]::Zero) # WM_GETICON
+        $size = [MdSmoke]::IconSize($icon)
+        $widthMetric = if ($type -eq 0) { 49 } else { 11 } # SM_CXSMICON / SM_CXICON
+        $width = [MdSmoke]::GetSystemMetricsForDpi($widthMetric,$dpi)
+        $height = [MdSmoke]::GetSystemMetricsForDpi($widthMetric + 1,$dpi)
+        Assert ($size[0] -eq $width -and $size[1] -eq $height) "window icon type $type has native ${width}x${height} pixels at $dpi DPI"
+    }
+}
 function Read-Selection($process, $control) {
     $bytes = [MdSmoke]::Remote($process.Id,$control,1076,[IntPtr]::Zero,[byte[]]::new(8))
     return @([BitConverter]::ToInt32($bytes,0), [BitConverter]::ToInt32($bytes,4))
@@ -263,11 +287,20 @@ $markdown += "`r`n| Grid header | Amount |`r`n| :--- | ---: |`r`n| **Table body*
 $processes = [Collections.Generic.List[Diagnostics.Process]]::new()
 $clipboardBackup = [MdSmoke]::Clipboard()
 try {
+    $largeIcon = $smallIcon = [IntPtr]::Zero
+    try {
+        $iconCount = [MdSmoke]::ExtractIconEx($exe,0,[ref]$largeIcon,[ref]$smallIcon,1)
+        Assert ($iconCount -gt 0 -and ([MdSmoke]::IconSize($largeIcon))[0] -gt 0 -and ([MdSmoke]::IconSize($smallIcon))[0] -gt 0) 'Windows shell extracts the embedded application icon in both sizes'
+    } finally {
+        if ($largeIcon -ne [IntPtr]::Zero) { [void][MdSmoke]::DestroyIcon($largeIcon) }
+        if ($smallIcon -ne [IntPtr]::Zero) { [void][MdSmoke]::DestroyIcon($smallIcon) }
+    }
     $process = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
     $processes.Add($process)
     $w = Wait-Window $process
     # WinMain opens the command-line document just after showing the window.
     for ($n = 0; $n -lt 100 -and [MdSmoke]::Content($w) -notlike '*with spaces.md*'; ++$n) { Start-Sleep -Milliseconds 50 }
+    Check-Icons $w ([MdSmoke]::GetDpiForWindow($w))
     $source = [MdSmoke]::GetDlgItem($w, 300)
     $view = [MdSmoke]::GetDlgItem($w, 301)
     Assert ([MdSmoke]::Content($source).Contains('**bold**')) 'quoted Unicode command-line file preserves Markdown source'
@@ -418,6 +451,7 @@ try {
     $systemDpi = [MdSmoke]::SystemDpi()
     foreach ($testDpi in @(96,144,192,$systemDpi)) {
         [void][MdSmoke]::Rectangle($w,736,[IntPtr](($testDpi -shl 16) -bor $testDpi),[ref]$rect)
+        Check-Icons $w $testDpi
         Command $w 203
         Command $w 203
         $zoom = [MdSmoke]::Zoom($blank.Id,$view)

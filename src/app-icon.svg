@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Markdown Editor — a weightless ivory quill on deep teal</title>
+  <path fill="#193F3D" d="M64 12 L192 12 C221 12 244 35 244 64 L244 192 C244 221 221 244 192 244 L64 244 C35 244 12 221 12 192 L12 64 C12 35 35 12 64 12 Z"/>
+  <path fill="#F5F1E7" d="M73 190 C84 171 84 142 101 113 C120 80 153 58 193 56 C191 94 173 126 145 146 C129 158 111 165 94 168 L79 194 C76 199 69 195 73 190 Z"/>
+  <path fill="#193F3D" d="M84 177 C105 137 139 101 176 76 C144 107 115 141 94 180 Z"/>
+</svg>

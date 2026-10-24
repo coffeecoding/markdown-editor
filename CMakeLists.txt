@@ -13,6 +13,8 @@ endif()
 add_executable(markdown-editor WIN32
     src/main.cpp src/document.cpp src/markdown.cpp src/app.rc
     third_party/md4c/md4c.c third_party/md4c/entity.c)
+set_source_files_properties(src/app.rc PROPERTIES
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/app.ico")
 target_compile_features(markdown-editor PRIVATE cxx_std_17)
 target_compile_definitions(markdown-editor PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN
     NOMINMAX _WIN32_WINNT=0x0A00)

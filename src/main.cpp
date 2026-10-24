@@ -10,6 +10,7 @@
 #include <gdiplus.h>
 #include "document.h"
 #include "markdown.h"
+#include "resource.h"
 #include <algorithm>
 #include <cstring>
 #include <cwctype>
@@ -56,6 +57,7 @@ void Restore(HWND control, const Position& p, bool exactPixels = true)
 struct App {
     HINSTANCE instance{};
     HWND window{}, source{}, preview{};
+    HICON largeIcon{}, smallIcon{};
     bool editMode = true, dirty = false, renderDirty = true, loading = false;
     bool darkTheme = false;
     UINT dpi = 96;
@@ -68,7 +70,29 @@ struct App {
     SourceMap previewMapping;
     std::vector<TableLayout> previewTables;
 
-    ~App() { if (!privateFontPath.empty()) RemoveFontResourceExW(privateFontPath.c_str(), FR_PRIVATE, nullptr); }
+    ~App()
+    {
+        if (largeIcon) DestroyIcon(largeIcon);
+        if (smallIcon) DestroyIcon(smallIcon);
+        if (!privateFontPath.empty()) RemoveFontResourceExW(privateFontPath.c_str(), FR_PRIVATE, nullptr);
+    }
+
+    void UpdateIcons()
+    {
+        // Use the monitor's actual caption/task-switcher sizes. The resource
+        // contains small frames as well as the large Explorer artwork.
+        for (int type : {ICON_BIG, ICON_SMALL}) {
+            const bool isSmall = type == ICON_SMALL;
+            HICON next{};
+            if (FAILED(LoadIconWithScaleDown(instance, MAKEINTRESOURCEW(IDI_APP),
+                GetSystemMetricsForDpi(isSmall ? SM_CXSMICON : SM_CXICON, dpi),
+                GetSystemMetricsForDpi(isSmall ? SM_CYSMICON : SM_CYICON, dpi), &next))) continue;
+            SendMessageW(window, WM_SETICON, type, reinterpret_cast<LPARAM>(next));
+            HICON& previous = isSmall ? smallIcon : largeIcon;
+            if (previous) DestroyIcon(previous);
+            previous = next;
+        }
+    }
 
     void Error(const std::wstring& message)
     {
@@ -569,6 +593,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     switch (message) {
     case WM_CREATE: {
         app->dpi = GetDpiForWindow(window);
+        app->UpdateIcons();
         HDC dc = GetDC(window);
         app->richEditBaseDpi = GetDeviceCaps(dc, LOGPIXELSY);
         ReleaseDC(window, dc);
@@ -613,6 +638,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         auto sourcePosition = Remember(app->source), viewPosition = Remember(app->preview);
         const RECT r = *reinterpret_cast<RECT*>(lparam);
         app->dpi = HIWORD(wparam);
+        app->UpdateIcons();
         SetWindowPos(window, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
         app->Scale(app->dpi);
         Restore(app->source, sourcePosition, false);
@@ -687,7 +713,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     cls.lpfnWndProc = WindowProc;
     cls.hInstance = instance;
     cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    cls.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    cls.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP));
     cls.lpszClassName = WindowClass;
     RegisterClassW(&cls);
     const UINT dpi = GetDpiForSystem();

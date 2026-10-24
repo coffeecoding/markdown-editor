@@ -1,4 +1,7 @@
 #include <windows.h>
+#include "resource.h"
+
+IDI_APP ICON "app.ico"
 1 RT_MANIFEST "app.manifest"
 
 1 VERSIONINFO
