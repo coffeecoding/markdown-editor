@@ -4,7 +4,7 @@ A small, portable Markdown editor for Windows x64, built with C++17 and native
 Win32 controls. Edit the Markdown source or read a formatted preview, without a
 browser engine, extra runtime, installer, or startup network access.
 
-- CommonMark headings, emphasis, lists, quotes, links, code, and Unicode.
+- CommonMark headings, emphasis, lists, quotes, links, code, Unicode, and pipe tables.
 - Separate Edit/View controls that preserve undo history, selection, and scrolling.
 - Double-click the preview to edit at the corresponding source character.
 - Light/dark themes, configurable colors and fonts, and per-monitor DPI scaling.
@@ -12,7 +12,7 @@ browser engine, extra runtime, installer, or startup network access.
 ## Run
 
 Copy `markdown-editor.exe` and `MD4C-LICENSE.txt` from [release/](release/) into
-a permanent folder. The required distribution is about **323 KiB**.
+a permanent folder. The required distribution is about **337 KiB**.
 
 From repository-root PowerShell:
 
@@ -74,11 +74,14 @@ Application code is in `src/`, native checks in `tests/`, and the vendored
 & '.\smoke.ps1'
 ```
 
-The renderer checks rebuild Release; `-Benchmark` also reports mapping memory
-and render timings. The smoke suite exercises native windows, file handling,
-themes, undo/redo, Unicode, DPI handlers, and exact source navigation. Generated
+The renderer checks rebuild Release; `-Benchmark` also reports mapping and table
+layout memory, render timings, native cell measurement, and cached table resizing.
+The smoke suite exercises native windows, file handling, themes, undo/redo,
+Unicode, tables, DPI handlers, and exact source navigation. Generated
 files stay under ignored `build/`. Physical mouse interaction, visible caret
 appearance, and real mixed-monitor movement still need manual checks.
+Viewport checks also cover outer padding when scrolling tables, resizing, and
+showing or hiding the horizontal scrollbar.
 
 ## Settings and file handling
 
@@ -87,19 +90,46 @@ optional private TTF font are configured in `markdown-editor.ini` beside the
 executable; see [the configuration example](markdown-editor.ini.example).
 The app fills in missing palette defaults. Restart after changing colors or
 fonts. The executable's folder must be writable to persist settings.
+Table borders have an independent `table_border` RGB setting, defaulting to
+`#C1BFB9` in Light and `#484848` in Dark. Changing text or background colors does
+not recompute this setting; invalid entries use the corresponding default.
 
 Markdown source is always authoritative. Saves preserve supported encodings
 (UTF-8 and UTF-16 with BOM) and newline conventions; failed saves retain unsaved
 work. New files use UTF-8 without BOM and CRLF. Invalid Unicode, embedded NULs,
 and files over 32 MiB are rejected. There is no autosave or recovery file.
 
-Preview uses MD4C CommonMark, with readable image and inert HTML fallbacks.
-Images are not downloaded. Tables and other Markdown extensions are currently
-unsupported; code is not syntax-highlighted.
+Preview uses MD4C CommonMark with only its pipe-table extension enabled (the
+renderer API also supports explicit strict `CommonMark`). Tables use native
+Rich Edit cells with a thin 0.5-point full grid, bold headers without added fill,
+and left/center/right alignment from the Markdown separator row. Inline styles,
+links, entities, Unicode, and list/quote indentation are retained.
+
+Columns use the largest formatted cell width, including bold headers and modest
+padding. Compact tables keep their natural width; wider tables shrink their
+widest columns first and wrap cell text. Columns have an 18-point minimum. If
+those minimums cannot fit, the preview scrolls horizontally while surrounding
+prose stays wrapped. Partial rows are clipped at the viewport edges; vertical
+padding sits outside the native text window to avoid stale table text at the
+bottom while scrolling. Resizing and DPI changes reuse cached row positions and
+preferred widths without reparsing or measuring again. Double-click navigation
+uses native cell and hidden row offsets; copying produces ordinary cell text.
+Tables beyond Rich Edit's [63-column limit](https://learn.microsoft.com/en-us/windows/win32/controls/em-settableparms)
+fall back to readable tab-separated rows with every parsed cell retained.
+
+Images use a readable fallback and are not downloaded; HTML is shown as inert
+source. Other Markdown extensions are unsupported; code is not syntax-highlighted.
+
+On the development machine, the existing large/dense renderer benchmarks remain
+about 8/14 ms with unchanged mapping memory. The table workload (80 tables,
+720 rows, 2,880 cells) takes about 162 ms to render, dominated by native formatted
+cell measurement, and 9 ms to resize from cached widths. Its retained table
+metadata occupies 8,640 bytes (9,424 allocated), in addition to source mapping.
+These timings depend on fonts and hardware; run the benchmark for local results.
 
 ## Roadmap
 
-- [ ] Table rendering
+- [x] Table rendering
 - [ ] Emoji support
 - [ ] Recent files
 - [ ] Status bar

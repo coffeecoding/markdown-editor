@@ -6,6 +6,8 @@ extern "C" {
 }
 #include <cstdint>
 #include <algorithm>
+#include <cstring>
+#include <richedit.h>
 #include <vector>
 
 namespace {
@@ -75,10 +77,110 @@ std::wstring Attribute(const MD_ATTRIBUTE& attr)
     return result;
 }
 
+constexpr LONG CellPadding = 80; // Four points on either side.
+constexpr LONG MinimumColumn = 360; // Eighteen points, including padding.
+
+std::string RtfHeader(const RenderOptions& options)
+{
+    std::string out = "{\\rtf1\\ansi\\ansicpg1252\\deff0\\uc1{\\fonttbl{\\f0\\fnil ";
+    Escape(out, options.bodyFont);
+    out += ";}{\\f1\\fmodern ";
+    Escape(out, options.codeFont);
+    out += ";}}{\\colortbl;";
+    for (COLORREF color : {options.palette.text, options.palette.link, options.palette.muted,
+                           options.palette.code, options.palette.tableBorder})
+        out += "\\red" + std::to_string(GetRValue(color)) + "\\green" +
+            std::to_string(GetGValue(color)) + "\\blue" + std::to_string(GetBValue(color)) + ";";
+    return out + "}\\viewkind4\\cf1 ";
+}
+
+bool StreamRtf(HWND control, const std::string& rtf)
+{
+    struct Input { const std::string& text; size_t offset = 0; } input{rtf};
+    EDITSTREAM stream{};
+    stream.dwCookie = reinterpret_cast<DWORD_PTR>(&input);
+    stream.pfnCallback = [](DWORD_PTR cookie, LPBYTE buffer, LONG requested, LONG* supplied) -> DWORD {
+        auto& data = *reinterpret_cast<Input*>(cookie);
+        const size_t count = std::min<size_t>(requested, data.text.size() - data.offset);
+        std::memcpy(buffer, data.text.data() + data.offset, count);
+        data.offset += count;
+        *supplied = static_cast<LONG>(count);
+        return 0;
+    };
+    SendMessageW(control, EM_STREAMIN, SF_RTF, reinterpret_cast<LPARAM>(&stream));
+    return !stream.dwError;
+}
+
+// Water-fill the widest columns: short columns retain their natural widths.
+// If even the minimums overflow, native horizontal scrolling exposes them.
+std::vector<LONG> ColumnWidths(const TableLayout& table, LONG available)
+{
+    auto widths = table.preferredWidths;
+    if (widths.empty()) return widths;
+    const LONG budget = std::max<LONG>(MinimumColumn * static_cast<LONG>(widths.size()), available - table.indent);
+    const auto sumAt = [&](LONG cap) {
+        int64_t sum = 0;
+        for (LONG width : widths) sum += std::min(width, cap);
+        return sum;
+    };
+    LONG low = MinimumColumn, high = *std::max_element(widths.begin(), widths.end());
+    if (sumAt(high) <= budget) return widths;
+    while (low < high) {
+        const LONG middle = low + (high - low + 1) / 2;
+        if (sumAt(middle) <= budget) low = middle;
+        else high = middle - 1;
+    }
+    LONG remainder = budget - static_cast<LONG>(sumAt(low));
+    for (auto& width : widths) {
+        const LONG preferred = width;
+        width = std::min(width, low);
+        if (remainder && preferred > low) { ++width; --remainder; }
+    }
+    return widths;
+}
+
+struct CellMeasurer {
+    HMODULE library = nullptr;
+    HWND control = nullptr;
+    LONG baseDpi = 96;
+    ~CellMeasurer() { if (control) DestroyWindow(control); if (library) FreeLibrary(library); }
+
+    LONG Width(const std::string& rtf)
+    {
+        if (!control) {
+            library = LoadLibraryExW(L"Msftedit.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (!library) return -1;
+            control = CreateWindowExW(WS_EX_TOOLWINDOW, MSFTEDIT_CLASS, L"",
+                WS_POPUP | ES_MULTILINE | ES_AUTOHSCROLL, 0, 0, 1, 1,
+                nullptr, nullptr, nullptr, nullptr);
+            if (!control) return -1;
+            HDC dc = GetDC(control);
+            baseDpi = GetDeviceCaps(dc, LOGPIXELSX);
+            ReleaseDC(control, dc);
+            SendMessageW(control, EM_EXLIMITTEXT, 0, 32 * 1024 * 1024);
+            SendMessageW(control, EM_SETUNDOLIMIT, 0, 0);
+            // A huge formatting rectangle and native nonwrapping layout allow
+            // EM_POSFROMCHAR to measure shaped text, including font fallback.
+            RECT rect{0, 0, 0x3fffffff, 1000};
+            SendMessageW(control, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&rect));
+        }
+        if (!StreamRtf(control, rtf)) return -1;
+        GETTEXTLENGTHEX length{GTL_PRECISE | GTL_NUMCHARS, 1200};
+        const LONG end = static_cast<LONG>(SendMessageW(control, EM_GETTEXTLENGTHEX, reinterpret_cast<WPARAM>(&length), 0));
+        POINTL first{}, last{};
+        SendMessageW(control, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&first), 0);
+        SendMessageW(control, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&last), end);
+        // Round up and leave one pixel of slack for native pixel rounding.
+        return std::max<LONG>(MinimumColumn, MulDiv(std::max<LONG>(0, last.x - first.x) + 1, 1440, baseDpi) + 2 * CellPadding);
+    }
+};
+
 struct Renderer {
     struct List { bool ordered; unsigned next; bool tight; };
     struct Checkpoint { MD_SIZE byte; LONG source; };
     const std::string& input;
+    const RenderOptions options;
+    const std::string header;
     std::string out;
     std::vector<Checkpoint> checkpoints;
     Checkpoint resolved{0, 0};
@@ -88,8 +190,16 @@ struct Renderer {
     std::vector<bool> firstItemParagraph;
     unsigned quoteDepth = 0;
     bool paragraphOpen = false;
+    struct Cell { std::string rtf; };
+    std::vector<std::vector<Cell>> tableRows;
+    std::vector<TableLayout> tables;
+    TableLayout table;
+    std::string beforeTable;
+    bool nativeTable = false;
+    CellMeasurer measurer; // No HWND or library load until the first native table.
 
-    explicit Renderer(const std::string& utf8) : input(utf8)
+    explicit Renderer(const std::string& utf8, const RenderOptions& settings = {})
+        : input(utf8), options(settings), header(RtfHeader(options)), out(header)
     {
         checkpoints.push_back({0, 0});
         LONG sourceOffset = 0;
@@ -156,9 +266,79 @@ struct Renderer {
         paragraphOpen = true;
     }
 
+    bool FinishTable()
+    {
+        // A table alone is buffered, so all rows share content-based widths.
+        // Fragments contain the exact character formatting used in the view.
+        if (nativeTable) {
+            for (const auto& row : tableRows) {
+                for (size_t i = 0; i < row.size(); ++i) {
+                    const LONG width = measurer.Width(header + "\\pard " + row[i].rtf + "}");
+                    if (width < 0) return false;
+                    table.preferredWidths[i] = std::max(table.preferredWidths[i], width);
+                }
+            }
+        }
+        out = std::move(beforeTable);
+        const auto widths = ColumnWidths(table, options.tableWidth);
+        for (const auto& row : tableRows) {
+            if (nativeTable) {
+                out += "\\trowd\\trql\\trgaph" + std::to_string(CellPadding) + "\\trleft" + std::to_string(table.indent);
+                LONG right = table.indent;
+                for (LONG width : widths) {
+                    right += width;
+                    for (const char* side : {"l", "t", "r", "b"})
+                        out += std::string("\\clbrdr") + side + "\\brdrs\\brdrw10\\brdrcf5";
+                    out += "\\cellx" + std::to_string(right);
+                }
+                out += '\n';
+            }
+            for (size_t i = 0; i < row.size(); ++i) {
+                if (nativeTable) out += "\\pard\\intbl";
+                else if (!i) out += "\\pard\\li" + std::to_string(table.indent);
+                out += row[i].rtf;
+                out += nativeTable ? "\\cell " : (i + 1 < row.size() ? "\\tab " : "");
+            }
+            out += nativeTable ? "\\row\n" : "\\par\n";
+        }
+        if (nativeTable) {
+            tables.push_back(std::move(table));
+            // Separate adjacent tables and reset native table paragraph state.
+            out += "\\pard\\plain\\f0\\fs24\\cf1\\sa0\\par\n";
+            ++displayed;
+        }
+        tableRows.clear();
+        return true;
+    }
+
     int EnterBlock(MD_BLOCKTYPE type, void* detail)
     {
         switch (type) {
+        case MD_BLOCK_TABLE: {
+            EndParagraph();
+            const unsigned columns = static_cast<MD_BLOCK_TABLE_DETAIL*>(detail)->col_count;
+            nativeTable = columns <= 63;
+            table = {};
+            table.indent = static_cast<LONG>(lists.size()) * 360 + quoteDepth * 300;
+            if (nativeTable) table.preferredWidths.assign(columns, MinimumColumn);
+            beforeTable = std::move(out);
+            out.clear();
+            break;
+        }
+        case MD_BLOCK_TR:
+            tableRows.emplace_back();
+            if (nativeTable) { table.rows.push_back(displayed); displayed += 2; }
+            break;
+        case MD_BLOCK_TH: case MD_BLOCK_TD: {
+            if (!nativeTable && !tableRows.back().empty()) ++displayed; // Text fallback's tab separator.
+            const auto align = static_cast<MD_BLOCK_TD_DETAIL*>(detail)->align;
+            out = "\\plain\\f0\\fs24\\cf" + std::string(quoteDepth ? "3" : "1") +
+                "\\sa40\\sb40\\sl300\\slmult1";
+            out += nativeTable && align == MD_ALIGN_CENTER ? "\\qc" : nativeTable && align == MD_ALIGN_RIGHT ? "\\qr" : "\\ql";
+            if (type == MD_BLOCK_TH) out += "\\b";
+            out += ' ';
+            break;
+        }
         case MD_BLOCK_QUOTE: EndParagraph(); ++quoteDepth; break;
         case MD_BLOCK_UL: EndParagraph(); lists.push_back({false, 0, static_cast<MD_BLOCK_UL_DETAIL*>(detail)->is_tight != 0}); break;
         case MD_BLOCK_OL: {
@@ -194,6 +374,14 @@ struct Renderer {
     int LeaveBlock(MD_BLOCKTYPE type)
     {
         switch (type) {
+        case MD_BLOCK_TABLE: return FinishTable() ? 0 : 1;
+        case MD_BLOCK_TR: displayed += nativeTable ? 2 : 1; break;
+        case MD_BLOCK_TH: case MD_BLOCK_TD:
+            tableRows.back().push_back({std::move(out)});
+            out.clear();
+            // Rich Edit stores a terminator for every cell, including the last.
+            if (nativeTable) ++displayed;
+            break;
         case MD_BLOCK_QUOTE: EndParagraph(); --quoteDepth; break;
         case MD_BLOCK_UL: case MD_BLOCK_OL: EndParagraph(); lists.pop_back(); break;
         case MD_BLOCK_LI: EndParagraph(); firstItemParagraph.pop_back(); break;
@@ -274,20 +462,12 @@ LONG SourceMap::SourceAt(LONG renderedOffset) const
 
 bool RenderMarkdown(const std::wstring& source, const RenderOptions& options, RenderedMarkdown& result)
 {
-    if (options.flavor != MarkdownFlavor::CommonMark) return false;
+    if (options.flavor != MarkdownFlavor::CommonMark && options.flavor != MarkdownFlavor::CommonMarkWithTables) return false;
     const auto utf8 = ToUtf8(source);
     if (!source.empty() && utf8.empty()) return false;
-    Renderer renderer(utf8);
-    renderer.out = "{\\rtf1\\ansi\\ansicpg1252\\deff0\\uc1{\\fonttbl{\\f0\\fnil ";
-    Escape(renderer.out, options.bodyFont);
-    renderer.out += ";}{\\f1\\fmodern ";
-    Escape(renderer.out, options.codeFont);
-    renderer.out += ";}}{\\colortbl;";
-    for (COLORREF color : {options.palette.text, options.palette.link, options.palette.muted, options.palette.code})
-        renderer.out += "\\red" + std::to_string(GetRValue(color)) + "\\green" +
-            std::to_string(GetGValue(color)) + "\\blue" + std::to_string(GetBValue(color)) + ";";
-    renderer.out += "}\\viewkind4\\cf1 ";
-    MD_PARSER parser{}; // flags == 0 selects MD4C's CommonMark dialect.
+    Renderer renderer(utf8, options);
+    MD_PARSER parser{}; // Only enable the table extension; strict CommonMark remains available.
+    parser.flags = options.flavor == MarkdownFlavor::CommonMarkWithTables ? MD_FLAG_TABLES : 0;
     parser.enter_block = [](MD_BLOCKTYPE type, void* detail, void* data) { return static_cast<Renderer*>(data)->EnterBlock(type, detail); };
     parser.leave_block = [](MD_BLOCKTYPE type, void*, void* data) { return static_cast<Renderer*>(data)->LeaveBlock(type); };
     parser.enter_span = [](MD_SPANTYPE type, void*, void* data) { return static_cast<Renderer*>(data)->EnterSpan(type); };
@@ -298,5 +478,31 @@ bool RenderMarkdown(const std::wstring& source, const RenderOptions& options, Re
     renderer.out += '}';
     result.rtf = std::move(renderer.out);
     result.mapping = std::move(renderer.mapping);
+    result.tables = std::move(renderer.tables);
+    return true;
+}
+
+bool ResizeMarkdownTables(HWND preview, const std::vector<TableLayout>& tables, LONG availableWidth)
+{
+    for (const auto& table : tables) {
+        const auto widths = ColumnWidths(table, availableWidth);
+        for (LONG position : table.rows) {
+            TABLEROWPARMS row{};
+            row.cbRow = sizeof(row);
+            row.cbCell = sizeof(TABLECELLPARMS);
+            row.cCell = static_cast<BYTE>(widths.size());
+            row.cRow = 1;
+            row.cpStartRow = position;
+            TABLECELLPARMS cells[63]{};
+            if (SendMessageW(preview, EM_GETTABLEPARMS, reinterpret_cast<WPARAM>(&row), reinterpret_cast<LPARAM>(cells)) != S_OK)
+                return false;
+            // Retain native borders, shading and row attributes verbatim.
+            for (size_t i = 0; i < widths.size(); ++i) cells[i].dxWidth = widths[i];
+            row.cRow = 1;
+            row.cpStartRow = position;
+            if (SendMessageW(preview, EM_SETTABLEPARMS, reinterpret_cast<WPARAM>(&row), reinterpret_cast<LPARAM>(cells)) != S_OK)
+                return false;
+        }
+    }
     return true;
 }

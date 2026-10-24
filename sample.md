@@ -5,9 +5,9 @@ A small **Windows** editor with *CommonMark* parsing, Unicode (Grüße, Ελλη
 ## Lists and quotes
 
 - Open a document in View mode.
-- Switch to Edit with **Ctrl+1**.
+- Switch to Edit with **Ctrl+T**.
   - Your source and undo history stay in the editor.
-- Return to View with **Ctrl+2** or toggle with **Ctrl+Tab**.
+- Return to View with **Esc** or toggle with **Ctrl+T**.
 
 3. This list starts at three.
 4. Save with **Ctrl+S**.
@@ -15,6 +15,16 @@ A small **Windows** editor with *CommonMark* parsing, Unicode (Grüße, Ελλη
 > A quoted paragraph with **strong text**.
 >
 > A second quoted paragraph.
+
+## Tables
+
+| Feature | Example | Size |
+| :--- | :---: | ---: |
+| **Native grid** | *Aligned* cells | 0.5 pt |
+| Unicode | 日本語 😀 &amp; Ω | 42 |
+| Inline code | `source.md` | 17 |
+| Escaped pipe | left\|right | |
+| Wrapping | Longer cell contents wrap when the window becomes narrow. | 128 |
 
 ---
 

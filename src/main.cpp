@@ -66,6 +66,7 @@ struct App {
     ThemePalette lightPalette = Palette(false), darkPalette = Palette(true);
     RenderOptions rendering;
     SourceMap previewMapping;
+    std::vector<TableLayout> previewTables;
 
     ~App() { if (!privateFontPath.empty()) RemoveFontResourceExW(privateFontPath.c_str(), FR_PRIVATE, nullptr); }
 
@@ -98,7 +99,8 @@ struct App {
         const wchar_t* section = dark ? L"theme.dark" : L"theme.light";
         struct Color { const wchar_t* key; COLORREF ThemePalette::* field; };
         const Color colors[] = {{L"background", &ThemePalette::background}, {L"text", &ThemePalette::text},
-            {L"link", &ThemePalette::link}, {L"muted", &ThemePalette::muted}, {L"code", &ThemePalette::code}};
+            {L"link", &ThemePalette::link}, {L"muted", &ThemePalette::muted}, {L"code", &ThemePalette::code},
+            {L"table_border", &ThemePalette::tableBorder}};
         // Enumerate keys so an existing empty/invalid value is distinguishable
         // from a missing entry, and is left available for the user to correct.
         std::vector<wchar_t> keys(256);
@@ -219,6 +221,7 @@ struct App {
         renderDirty = true;
         if (!editMode) Render();
         for (HWND child : {source, preview}) InvalidateRect(child, nullptr, TRUE);
+        InvalidateRect(window, nullptr, TRUE);
         return true;
     }
 
@@ -235,17 +238,44 @@ struct App {
 
     void Layout()
     {
+        const auto position = Remember(preview);
+        const LONG previousWidth = rendering.tableWidth;
         RECT client{};
         GetClientRect(window, &client);
+        const int verticalPadding = MulDiv(14, dpi, 96);
+        const int horizontalPadding = MulDiv(18, dpi, 96);
         for (HWND child : {source, preview}) {
             if (!child) continue;
-            MoveWindow(child, 0, 0, client.right, client.bottom, TRUE);
-            RECT text{MulDiv(18, dpi, 96), MulDiv(14, dpi, 96),
-                std::max<LONG>(MulDiv(19, dpi, 96), client.right - MulDiv(18, dpi, 96) - GetSystemMetricsForDpi(SM_CXVSCROLL, dpi)),
-                std::max<LONG>(MulDiv(15, dpi, 96), client.bottom - MulDiv(14, dpi, 96))};
-            SendMessageW(child, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&text));
+            // Keep vertical padding outside the HWND. Native table painting
+            // can escape an inset formatting rectangle, leaving stale rows in
+            // its bottom margin when only the text area is scrolled/repainted.
+            // The real window boundary clips tables, including partial rows.
+            MoveWindow(child, 0, verticalPadding, client.right,
+                std::max<LONG>(1, client.bottom - 2 * verticalPadding), TRUE);
+            SendMessageW(child, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                MAKELPARAM(horizontalPadding, horizontalPadding));
+            if (child == preview) {
+                RECT text{};
+                SendMessageW(child, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&text));
+                rendering.tableWidth = std::max<LONG>(1, MulDiv(text.right - text.left, 1440, dpi));
+            }
             InvalidateRect(child, nullptr, TRUE);
         }
+        if (previousWidth != rendering.tableWidth) {
+            // Reflow prose to the updated formatting rectangle as well.
+            SendMessageW(preview, EM_SETTARGETDEVICE, 0, 0);
+            if (!previewTables.empty()) {
+                const LRESULT modified = SendMessageW(preview, EM_GETMODIFY, 0, 0);
+                const bool visible = IsWindowVisible(preview) != FALSE;
+                if (visible) SendMessageW(preview, WM_SETREDRAW, FALSE, 0);
+                if (!ResizeMarkdownTables(preview, previewTables, rendering.tableWidth)) renderDirty = true;
+                SendMessageW(preview, EM_EMPTYUNDOBUFFER, 0, 0);
+                SendMessageW(preview, EM_SETMODIFY, modified, 0);
+                if (visible) SendMessageW(preview, WM_SETREDRAW, TRUE, 0);
+            }
+        }
+        Restore(preview, position);
+        InvalidateRect(window, nullptr, TRUE);
     }
 
     void Scale(UINT newDpi)
@@ -277,6 +307,7 @@ struct App {
         SendMessageW(preview, EM_STREAMIN, SF_RTF, reinterpret_cast<LPARAM>(&stream));
         if (stream.dwError) { Error(L"Windows could not display the rendered document. The source has been preserved."); return false; }
         previewMapping = std::move(rendered.mapping);
+        previewTables = std::move(rendered.tables);
         SendMessageW(preview, EM_EMPTYUNDOBUFFER, 0, 0);
         SendMessageW(preview, EM_SETMODIFY, FALSE, 0);
         SendMessageW(preview, EM_SETZOOM, dpi, richEditBaseDpi);
@@ -544,9 +575,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         const DWORD common = WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_NOHIDESEL | WS_TABSTOP | ES_NOOLEDRAGDROP;
         app->source = CreateWindowExW(0, MSFTEDIT_CLASS, L"", common | WS_VISIBLE | WS_HSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN,
             0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(SourceId)), app->instance, nullptr);
-        app->preview = CreateWindowExW(0, MSFTEDIT_CLASS, L"", common | ES_READONLY,
+        app->preview = CreateWindowExW(0, MSFTEDIT_CLASS, L"", common | ES_READONLY | WS_HSCROLL,
             0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(PreviewId)), app->instance, nullptr);
         if (!app->source || !app->preview) return -1;
+        // Allow overflowing tables to scroll horizontally while prose wraps.
+        SendMessageW(app->preview, EM_SETTARGETDEVICE, 0, 0);
         SendMessageW(app->source, EM_SETTEXTMODE, TM_PLAINTEXT | TM_MULTILEVELUNDO, 0);
         SendMessageW(app->source, EM_SETUNDOLIMIT, 1000, 0);
         SendMessageW(app->source, EM_SETEVENTMASK, 0, ENM_CHANGE);
@@ -625,7 +658,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     case WM_CLOSE: if (app->ResolveUnsaved()) DestroyWindow(window); return 0;
     case WM_QUERYENDSESSION: return app->ResolveUnsaved() ? TRUE : FALSE;
     case WM_ENDSESSION: if (wparam) DestroyWindow(window); return 0;
-    case WM_ERASEBKGND: return 1;
+    case WM_ERASEBKGND: {
+        // WS_CLIPCHILDREN leaves only the outer padding to paint here.
+        RECT client{};
+        GetClientRect(window, &client);
+        HBRUSH brush = CreateSolidBrush(app->rendering.palette.background);
+        FillRect(reinterpret_cast<HDC>(wparam), &client, brush);
+        DeleteObject(brush);
+        return 1;
+    }
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(window, message, wparam, lparam);
