@@ -7,7 +7,7 @@
 #include <tom.h>
 #include <dwmapi.h>
 #include <shellapi.h>
-#include <gdiplus.h>
+#include "settings.h"
 #include "document.h"
 #include "markdown.h"
 #include "resource.h"
@@ -24,6 +24,8 @@ constexpr int OpenId = 100, SaveId = 101, ExitId = 102;
 constexpr int EditId = 200, ViewId = 201, ToggleId = 202;
 constexpr int DarkThemeId = 203;
 constexpr int SourceId = 300, PreviewId = 301;
+constexpr UINT SettingsChanged = WM_APP + 1, SettingsFailure = WM_APP + 2;
+constexpr UINT_PTR SettingsTimer = 1;
 constexpr LONG TextLimit = 32 * 1024 * 1024;
 // windows.h defines the standard EDIT message under the same name. Use Rich
 // Edit's full-width POINTL variant, which also works beyond 65,535 characters.
@@ -32,7 +34,8 @@ constexpr UINT RichEditCharFromPos = WM_USER + 39; // EM_CHARFROMPOS
 struct Position {
     CHARRANGE selection{};
     POINT scroll{};
-    LONG firstLine = 0;
+    LONG firstLine = 0, anchor = 0;
+    POINT anchorPoint{};
 };
 
 Position Remember(HWND control)
@@ -41,17 +44,33 @@ Position Remember(HWND control)
     SendMessageW(control, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&p.selection));
     SendMessageW(control, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&p.scroll));
     p.firstLine = static_cast<LONG>(SendMessageW(control, EM_GETFIRSTVISIBLELINE, 0, 0));
+    p.anchor = static_cast<LONG>(SendMessageW(control, EM_LINEINDEX, p.firstLine, 0));
+    SendMessageW(control, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&p.anchorPoint), p.anchor);
     return p;
 }
 
 void Restore(HWND control, const Position& p, bool exactPixels = true)
 {
     SendMessageW(control, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&p.selection));
-    if (exactPixels) SendMessageW(control, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&p.scroll));
-    // Also handles Rich Edit's 16-bit pixel scroll range on long documents.
-    const LONG current = static_cast<LONG>(SendMessageW(control, EM_GETFIRSTVISIBLELINE, 0, 0));
-    if (!exactPixels || std::abs(current - p.firstLine) > 2)
-        SendMessageW(control, EM_LINESCROLL, 0, p.firstLine - current);
+    if (!exactPixels) {
+        // Reflow changes visual line numbers. Keep the same text at the top,
+        // including the partial-line offset, using Rich Edit's native layout.
+        const LONG line = static_cast<LONG>(SendMessageW(control, EM_EXLINEFROMCHAR, 0, p.anchor));
+        const LONG current = static_cast<LONG>(SendMessageW(control, EM_GETFIRSTVISIBLELINE, 0, 0));
+        SendMessageW(control, EM_LINESCROLL, 0, line - current);
+        POINT point{}, scroll{};
+        SendMessageW(control, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&point), p.anchor);
+        SendMessageW(control, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+        scroll.x = p.scroll.x;
+        scroll.y += point.y - p.anchorPoint.y;
+        SendMessageW(control, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    } else {
+        SendMessageW(control, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&p.scroll));
+        // Also handles Rich Edit's 16-bit pixel scroll range on long documents.
+        const LONG current = static_cast<LONG>(SendMessageW(control, EM_GETFIRSTVISIBLELINE, 0, 0));
+        if (std::abs(current - p.firstLine) > 2)
+            SendMessageW(control, EM_LINESCROLL, 0, p.firstLine - current);
+    }
 }
 
 struct App {
@@ -59,13 +78,16 @@ struct App {
     HWND window{}, source{}, preview{};
     HICON largeIcon{}, smallIcon{};
     bool editMode = true, dirty = false, renderDirty = true, loading = false;
-    bool darkTheme = false;
+    bool previewFontDirty = false, closing = false;
+    bool watcherFailureReported = false, settingsFailureReported = false;
+    UINT settingsRetryDelay = 100;
+    Settings settings;
+    SettingsWatcher watcher;
     UINT dpi = 96;
     UINT richEditBaseDpi = 96;
-    std::wstring path, savedSource, privateFontPath, customFamily, iniPath;
+    std::wstring path, savedSource, iniPath;
     std::wstring settingsError;
     FileFormat format;
-    ThemePalette lightPalette = Palette(false), darkPalette = Palette(true);
     RenderOptions rendering;
     SourceMap previewMapping;
     std::vector<TableLayout> previewTables;
@@ -74,7 +96,7 @@ struct App {
     {
         if (largeIcon) DestroyIcon(largeIcon);
         if (smallIcon) DestroyIcon(smallIcon);
-        if (!privateFontPath.empty()) RemoveFontResourceExW(privateFontPath.c_str(), FR_PRIVATE, nullptr);
+        watcher.Stop();
     }
 
     void UpdateIcons()
@@ -117,53 +139,6 @@ struct App {
         SetWindowTextW(window, ((dirty ? L"*" : L"") + filename + L" — Markdown Editor").c_str());
     }
 
-    ThemePalette LoadPalette(bool dark)
-    {
-        ThemePalette palette = Palette(dark);
-        const wchar_t* section = dark ? L"theme.dark" : L"theme.light";
-        struct Color { const wchar_t* key; COLORREF ThemePalette::* field; };
-        const Color colors[] = {{L"background", &ThemePalette::background}, {L"text", &ThemePalette::text},
-            {L"link", &ThemePalette::link}, {L"muted", &ThemePalette::muted}, {L"code", &ThemePalette::code},
-            {L"table_border", &ThemePalette::tableBorder}};
-        // Enumerate keys so an existing empty/invalid value is distinguishable
-        // from a missing entry, and is left available for the user to correct.
-        std::vector<wchar_t> keys(256);
-        while (GetPrivateProfileStringW(section, nullptr, L"", keys.data(), static_cast<DWORD>(keys.size()), iniPath.c_str()) == keys.size() - 2)
-            keys.resize(keys.size() * 2);
-        for (const auto& color : colors) {
-            bool present = false;
-            for (const wchar_t* key = keys.data(); *key; key += wcslen(key) + 1)
-                if (_wcsicmp(key, color.key) == 0) { present = true; break; }
-            if (!present) {
-                const COLORREF value = palette.*color.field;
-                wchar_t text[8]{};
-                swprintf_s(text, L"#%02X%02X%02X", GetRValue(value), GetGValue(value), GetBValue(value));
-                if (!WritePrivateProfileStringW(section, color.key, text, iniPath.c_str()) && settingsError.empty()) {
-                    const DWORD code = GetLastError();
-                    settingsError = L"Missing theme colors could not be saved to:\n" + iniPath + L"\n\n" + SystemError(code);
-                }
-                continue;
-            }
-            std::vector<wchar_t> buffer(128);
-            while (GetPrivateProfileStringW(section, color.key, L"", buffer.data(), static_cast<DWORD>(buffer.size()), iniPath.c_str()) == buffer.size() - 1)
-                buffer.resize(buffer.size() * 2);
-            std::wstring text(buffer.data());
-            const auto first = std::find_if_not(text.begin(), text.end(), [](wchar_t c) { return iswspace(c); });
-            const auto last = std::find_if_not(text.rbegin(), text.rend(), [](wchar_t c) { return iswspace(c); }).base();
-            if (first >= last || last - first != 7 || *first != L'#') continue;
-            unsigned value = 0;
-            bool valid = true;
-            for (auto digit = first + 1; digit != last; ++digit) {
-                const wchar_t c = towlower(*digit);
-                if (c >= L'0' && c <= L'9') value = value * 16 + c - L'0';
-                else if (c >= L'a' && c <= L'f') value = value * 16 + c - L'a' + 10;
-                else { valid = false; break; }
-            }
-            if (valid) palette.*color.field = RGB((value >> 16) & 255, (value >> 8) & 255, value & 255);
-        }
-        return palette;
-    }
-
     void LoadSettings()
     {
         std::vector<wchar_t> module(32768);
@@ -171,41 +146,69 @@ struct App {
         std::wstring directory(module.data());
         directory.resize(directory.find_last_of(L"\\/") + 1);
         iniPath = directory + L"markdown-editor.ini";
-        wchar_t theme[32]{};
-        GetPrivateProfileStringW(L"appearance", L"theme", L"light", theme, ARRAYSIZE(theme), iniPath.c_str());
-        darkTheme = _wcsicmp(theme, L"dark") == 0;
-        lightPalette = LoadPalette(false);
-        darkPalette = LoadPalette(true);
-        rendering.palette = darkTheme ? darkPalette : lightPalette;
-        wchar_t configured[32768]{};
-        GetPrivateProfileStringW(L"font", L"path", L"", configured, ARRAYSIZE(configured), iniPath.c_str());
-        std::wstring file(configured);
-        if (file.empty()) return;
-        if (!(file.size() >= 2 && file[1] == L':') && file[0] != L'\\' && file[0] != L'/') file = directory + file;
-        const auto dot = file.find_last_of(L'.');
-        if (dot == std::wstring::npos || _wcsicmp(file.c_str() + dot, L".ttf") != 0) return;
-        Gdiplus::GdiplusStartupInput input;
-        ULONG_PTR token = 0;
-        if (Gdiplus::GdiplusStartup(&token, &input, nullptr) != Gdiplus::Ok) return;
-        {
-            // Windows reads the font metadata; no application font parser.
-            Gdiplus::PrivateFontCollection collection;
-            if (collection.AddFontFile(file.c_str()) == Gdiplus::Ok && collection.GetFamilyCount() > 0) {
-                Gdiplus::FontFamily family;
-                INT found = 0;
-                wchar_t name[LF_FACESIZE]{};
-                if (collection.GetFamilies(1, &family, &found) == Gdiplus::Ok && found &&
-                    family.GetFamilyName(name) == Gdiplus::Ok && AddFontResourceExW(file.c_str(), FR_PRIVATE, nullptr)) {
-                    privateFontPath = file;
-                    customFamily = name;
-                    rendering.bodyFont = rendering.codeFont = customFamily;
-                }
-            }
-        }
-        Gdiplus::GdiplusShutdown(token);
+        DWORD code = 0;
+        ReadSettings(iniPath, settings, code);
     }
 
-    bool ApplyTheme()
+    bool UpdateSettings(Settings next)
+    {
+        const bool sourceFont = _wcsicmp(settings.edit.c_str(), next.edit.c_str()) != 0;
+        const bool previewFont = _wcsicmp(settings.prose.c_str(), next.prose.c_str()) != 0 ||
+            _wcsicmp(settings.code.c_str(), next.code.c_str()) != 0;
+        const bool changed = sourceFont || previewFont || settings.dark != next.dark ||
+            !SamePalette(settings.Colors(), next.Colors());
+        Settings previous = std::move(settings);
+        settings = std::move(next);
+        if (changed && !ApplyTheme(sourceFont, previewFont)) {
+            settings = std::move(previous);
+            return false;
+        }
+        return true;
+    }
+
+    void ReloadSettings()
+    {
+        if (closing) return;
+        Settings next;
+        DWORD code = 0;
+        if (!ReadSettings(iniPath, next, code)) {
+            if (code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION) {
+                SetTimer(window, SettingsTimer, settingsRetryDelay, nullptr);
+                settingsRetryDelay = std::min<UINT>(1000, settingsRetryDelay * 2);
+            } else if (!settingsFailureReported) {
+                settingsFailureReported = true;
+                Error(L"Settings could not be read. The current appearance is retained.\n" + iniPath + L"\n\n" + SystemError(code));
+            }
+            return;
+        }
+        settingsRetryDelay = 100;
+        UpdateSettings(std::move(next));
+    }
+
+    void WatchSettings()
+    {
+        DWORD code = 0;
+        if (!watcher.Start(window, iniPath, SettingsChanged, code)) {
+            settingsError = L"Live settings could not be watched. Editing remains available.\n" + iniPath + L"\n\n" + SystemError(code);
+            PostMessageW(window, SettingsFailure, 0, 0);
+        }
+        // Covers changes between the initial snapshot and arming the watcher,
+        // and retries a settings file already locked at startup.
+        SetTimer(window, SettingsTimer, 150, nullptr);
+    }
+
+    void CloseSettings()
+    {
+        if (closing) return;
+        closing = true;
+        KillTimer(window, SettingsTimer);
+        watcher.Stop();
+        std::wstring error;
+        if (!RepairSettings(iniPath, error))
+            Error(L"Settings could not be repaired. The original INI was retained.\n" + iniPath + L"\n\n" + error);
+    }
+
+    bool FormatSource(bool sourceFont)
     {
         // TOM suspends recording without discarding either undo or redo history.
         IRichEditOle* ole = nullptr;
@@ -223,26 +226,41 @@ struct App {
         const LRESULT events = SendMessageW(source, EM_SETEVENTMASK, 0, 0);
         // WM_SETREDRAW(TRUE) also sets WS_VISIBLE; never send it to the hidden source.
         if (editMode) SendMessageW(source, WM_SETREDRAW, FALSE, 0);
-        rendering.palette = darkTheme ? darkPalette : lightPalette;
         CHARFORMAT2W colors{};
         colors.cbSize = sizeof(colors);
         colors.dwMask = CFM_COLOR;
-        colors.crTextColor = rendering.palette.text;
+        if (sourceFont) {
+            colors.dwMask |= CFM_FACE | CFM_CHARSET;
+            colors.bCharSet = DEFAULT_CHARSET;
+            wcscpy_s(colors.szFaceName, settings.edit.c_str());
+        }
+        colors.crTextColor = settings.Colors().text;
         SendMessageW(source, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&colors));
-        SendMessageW(source, EM_SETBKGNDCOLOR, 0, rendering.palette.background);
-        SendMessageW(preview, EM_SETBKGNDCOLOR, 0, rendering.palette.background);
-        Restore(source, position);
+        SendMessageW(source, EM_SETBKGNDCOLOR, 0, settings.Colors().background);
+        Restore(source, position, !sourceFont);
         SendMessageW(source, EM_SETMODIFY, modified, 0);
         SendMessageW(source, EM_SETEVENTMASK, 0, events);
         document->Undo(tomResume, nullptr);
         document->Release();
         if (editMode) SendMessageW(source, WM_SETREDRAW, TRUE, 0);
+        return true;
+    }
+
+    bool ApplyTheme(bool sourceFont = false, bool previewFont = false)
+    {
+        if (!FormatSource(sourceFont)) return false;
+        const bool previewChanged = !SamePalette(rendering.palette, settings.Colors()) || previewFont;
+        rendering.palette = settings.Colors();
+        rendering.bodyFont = settings.prose;
+        rendering.codeFont = settings.code;
+        previewFontDirty = previewFontDirty || previewFont;
+        SendMessageW(preview, EM_SETBKGNDCOLOR, 0, rendering.palette.background);
         // Best effort: older Windows versions may reject either attribute.
-        const BOOL dark = darkTheme;
+        const BOOL dark = settings.dark;
         if (FAILED(DwmSetWindowAttribute(window, 20, &dark, sizeof(dark))))
             DwmSetWindowAttribute(window, 19, &dark, sizeof(dark));
-        CheckMenuItem(GetMenu(window), DarkThemeId, MF_BYCOMMAND | (darkTheme ? MF_CHECKED : MF_UNCHECKED));
-        renderDirty = true;
+        CheckMenuItem(GetMenu(window), DarkThemeId, MF_BYCOMMAND | (settings.dark ? MF_CHECKED : MF_UNCHECKED));
+        renderDirty = renderDirty || previewChanged;
         if (!editMode) Render();
         for (HWND child : {source, preview}) InvalidateRect(child, nullptr, TRUE);
         InvalidateRect(window, nullptr, TRUE);
@@ -251,13 +269,12 @@ struct App {
 
     void ToggleTheme()
     {
-        darkTheme = !darkTheme;
-        if (!ApplyTheme()) { darkTheme = !darkTheme; return; }
-        if (!WritePrivateProfileStringW(L"appearance", L"theme", darkTheme ? L"dark" : L"light", iniPath.c_str())) {
-            const DWORD code = GetLastError();
-            Error(L"The theme is active for this session, but could not be saved to:\n" + iniPath +
-                  L"\n\n" + SystemError(code));
-        }
+        Settings next = settings;
+        next.dark = !next.dark;
+        if (!UpdateSettings(std::move(next))) return;
+        std::wstring error;
+        if (!SaveTheme(iniPath, settings.dark, error))
+            Error(L"The theme is active for this session, but could not be saved to:\n" + iniPath + L"\n\n" + error);
     }
 
     void Layout()
@@ -335,7 +352,8 @@ struct App {
         SendMessageW(preview, EM_EMPTYUNDOBUFFER, 0, 0);
         SendMessageW(preview, EM_SETMODIFY, FALSE, 0);
         SendMessageW(preview, EM_SETZOOM, dpi, richEditBaseDpi);
-        Restore(preview, position);
+        Restore(preview, position, !previewFontDirty);
+        previewFontDirty = false;
         renderDirty = false;
         return true;
     }
@@ -561,6 +579,10 @@ LRESULT CALLBACK ControlProc(HWND control, UINT message, WPARAM wparam, LPARAM l
         (wparam == 2 || wparam == 5 || wparam == 9 || wparam == 10 || wparam == 11 ||
          wparam == 12 || wparam == 18 || wparam == 20 || wparam == 21)) return 0;
     const LRESULT result = DefSubclassProc(control, message, wparam, lparam);
+    // Rich Edit's text undo records can also restore the former plain-text
+    // font/color. Reapply current appearance without recording another undo.
+    if (!view && (message == EM_UNDO || message == WM_UNDO || message == EM_REDO))
+        app.FormatSource(true);
     if (view && message != WM_NCDESTROY && GetFocus() == control) HideCaret(control);
     if (message == WM_NCDESTROY) RemoveWindowSubclass(control, ControlProc, 1);
     return result;
@@ -618,16 +640,44 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         font.cbSize = sizeof(font);
         font.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR | CFM_CHARSET;
         font.yHeight = 12 * 20;
-        font.crTextColor = app->rendering.palette.text;
+        font.crTextColor = app->settings.Colors().text;
         font.bCharSet = DEFAULT_CHARSET;
-        wcscpy_s(font.szFaceName, app->customFamily.empty() ? L"Consolas" : app->customFamily.c_str());
+        wcscpy_s(font.szFaceName, app->settings.edit.c_str());
         SendMessageW(app->source, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&font));
         SendMessageW(app->preview, EM_AUTOURLDETECT, AURL_ENABLEURL | AURL_ENABLEEMAILADDR, 0);
         SendMessageW(app->preview, EM_SETEVENTMASK, 0, ENM_LINK);
-        if (!app->ApplyTheme()) return -1;
+        if (!app->ApplyTheme(false, true)) return -1;
         app->Scale(app->dpi);
+        app->WatchSettings();
         return 0;
     }
+    case SettingsChanged: {
+        if (app->closing) return 0;
+        DWORD code = 0;
+        bool changed = false;
+        if (!app->watcher.Changed(changed, code) && !app->watcherFailureReported) {
+            app->settingsError = L"Live settings watching stopped. Editing remains available.\n" + app->iniPath + L"\n\n" + SystemError(code);
+            PostMessageW(window, SettingsFailure, 0, 0);
+        }
+        if (changed) {
+            app->settingsRetryDelay = 100;
+            SetTimer(window, SettingsTimer, 150, nullptr);
+        }
+        return 0;
+    }
+    case SettingsFailure:
+        if (!app->closing && !app->watcherFailureReported) {
+            app->watcherFailureReported = true;
+            app->Error(app->settingsError);
+        }
+        return 0;
+    case WM_TIMER:
+        if (wparam == SettingsTimer) {
+            KillTimer(window, SettingsTimer);
+            app->ReloadSettings();
+            return 0;
+        }
+        break;
     case WM_SIZE: app->Layout(); return 0;
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
@@ -681,9 +731,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         }
         break;
     }
-    case WM_CLOSE: if (app->ResolveUnsaved()) DestroyWindow(window); return 0;
+    case WM_CLOSE: if (app->ResolveUnsaved()) { app->CloseSettings(); DestroyWindow(window); } return 0;
     case WM_QUERYENDSESSION: return app->ResolveUnsaved() ? TRUE : FALSE;
-    case WM_ENDSESSION: if (wparam) DestroyWindow(window); return 0;
+    case WM_ENDSESSION: if (wparam) { app->CloseSettings(); DestroyWindow(window); } return 0;
     case WM_ERASEBKGND: {
         // WS_CLIPCHILDREN leaves only the outer padding to paint here.
         RECT client{};
@@ -693,7 +743,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         DeleteObject(brush);
         return 1;
     }
-    case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_DESTROY: app->watcher.Stop(); KillTimer(window, SettingsTimer); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(window, message, wparam, lparam);
 }
@@ -730,7 +780,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     if (args && count > 1) app.Open(args[1]);
     LocalFree(args);
     SetFocus(app.editMode ? app.source : app.preview);
-    if (!app.settingsError.empty()) app.Error(app.settingsError);
     MSG message{};
     int result;
     while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {

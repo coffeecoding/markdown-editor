@@ -11,7 +11,7 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 add_executable(markdown-editor WIN32
-    src/main.cpp src/document.cpp src/markdown.cpp src/app.rc
+    src/main.cpp src/document.cpp src/settings.cpp src/markdown.cpp src/app.rc
     third_party/md4c/md4c.c third_party/md4c/entity.c)
 set_source_files_properties(src/app.rc PROPERTIES
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/app.ico")
@@ -19,7 +19,7 @@ target_compile_features(markdown-editor PRIVATE cxx_std_17)
 target_compile_definitions(markdown-editor PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN
     NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(markdown-editor PRIVATE src third_party/md4c)
-target_link_libraries(markdown-editor PRIVATE comctl32 comdlg32 shell32 gdiplus dwmapi)
+target_link_libraries(markdown-editor PRIVATE comctl32 comdlg32 shell32 dwmapi)
 set_property(TARGET markdown-editor PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 target_compile_options(markdown-editor PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4> /utf-8 $<$<CONFIG:Release>:/GL>)
 target_link_options(markdown-editor PRIVATE $<$<CONFIG:Release>:/LTCG>

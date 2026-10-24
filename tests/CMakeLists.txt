@@ -16,3 +16,13 @@ target_link_options(mapping-checks PRIVATE $<$<CONFIG:Release>:/LTCG>
     $<$<CONFIG:Release>:/OPT:REF> $<$<CONFIG:Release>:/OPT:ICF>)
 enable_testing()
 add_test(NAME mapping-checks COMMAND mapping-checks)
+
+add_executable(settings-checks settings.cpp ../src/settings.cpp ../src/document.cpp)
+target_compile_features(settings-checks PRIVATE cxx_std_17)
+target_compile_definitions(settings-checks PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN
+    NOMINMAX _WIN32_WINNT=0x0A00)
+set_property(TARGET settings-checks PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+target_compile_options(settings-checks PRIVATE /W4 /utf-8 $<$<CONFIG:Release>:/GL>)
+target_link_options(settings-checks PRIVATE $<$<CONFIG:Release>:/LTCG>
+    $<$<CONFIG:Release>:/OPT:REF> $<$<CONFIG:Release>:/OPT:ICF>)
+add_test(NAME settings-checks COMMAND settings-checks)

@@ -1,4 +1,4 @@
-# Brief integration smoke check, using only PowerShell and Windows APIs.
+﻿# Brief integration smoke check, using only PowerShell and Windows APIs.
 # Run after build.ps1. It starts hidden copies in build\smoke and does not
 # touch user documents or associations. Clipboard copy is checked and restored.
 $ErrorActionPreference = 'Stop'
@@ -17,6 +17,7 @@ public static class MdSmoke {
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr w);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr w, StringBuilder b, int n);
     [DllImport("user32.dll",EntryPoint="SendMessageW")] public static extern IntPtr Send(IntPtr w, uint m, IntPtr p, IntPtr l);
+    [DllImport("user32.dll",EntryPoint="SendMessageTimeoutW")] public static extern IntPtr SendTimeout(IntPtr w, uint m, IntPtr p, IntPtr l, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll",EntryPoint="SendMessageW",CharSet=CharSet.Unicode)] public static extern IntPtr Text(IntPtr w, uint m, IntPtr p, string text);
     [DllImport("user32.dll",EntryPoint="SendMessageW",CharSet=CharSet.Unicode)] public static extern IntPtr Read(IntPtr w, uint m, IntPtr p, StringBuilder text);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr w, uint m, IntPtr p, IntPtr l);
@@ -106,7 +107,22 @@ function Wait-Window($process, [string]$class = 'NativeMarkdownEditorWindow') {
     }
     throw "Window did not appear: $class"
 }
-function Command($w, [int]$id) { [void][MdSmoke]::Send($w, 273, [IntPtr]$id, [IntPtr]::Zero) }
+function Command($w, [int]$id, [switch]$SkipSettle) {
+    $result = [IntPtr]::Zero
+    if ([MdSmoke]::SendTimeout($w,273,[IntPtr]$id,[IntPtr]::Zero,0,5000,[ref]$result) -eq [IntPtr]::Zero) {
+        [uint32]$owner = 0
+        [void][MdSmoke]::GetWindowThreadProcessId($w,[ref]$owner)
+        $dialog = [MdSmoke]::Find($owner,'#32770')
+        $messages = [Collections.Generic.List[string]]::new()
+        if ($dialog -ne [IntPtr]::Zero) {
+            [void][MdSmoke]::EnumChildWindows($dialog,{param($child,$unused) $messages.Add([MdSmoke]::Content($child)); return $true},[IntPtr]::Zero)
+        }
+        throw "Command $id did not complete within five seconds. $($messages -join ' ')"
+    }
+    # Let the atomic preference write and its debounced notification finish
+    # before synthetic messages start the next menu action.
+    if ($id -eq 203 -and -not $SkipSettle) { Start-Sleep -Milliseconds 180 }
+}
 function Post-Command($w, [int]$id) { [void][MdSmoke]::PostMessage($w, 273, [IntPtr]$id, [IntPtr]::Zero) }
 function Dismiss-Error($dialog) {
     # EnumWindows can see a MessageBox before its buttons are initialized.
@@ -147,10 +163,31 @@ function Dialog-Path($process, [string]$path) {
     }
     Start-Sleep -Milliseconds 200
 }
-function Read-Font($process, $control) {
+function Wait-Setting([scriptblock]$condition, [string]$description) {
+    for ($n=0; $n -lt 150; ++$n) {
+        if (& $condition) { Assert $true $description; return }
+        Start-Sleep -Milliseconds 40
+    }
+    throw "FAIL: $description (live update timed out)"
+}
+function Read-Font($process, $control, [string]$needle = '') {
+    $selection = Read-Selection $process $control
+    $scroll = [MdSmoke]::Remote($process.Id,$control,1245,[IntPtr]::Zero,[byte[]]::new(8))
+    $firstLine = [MdSmoke]::Send($control,206,[IntPtr]::Zero,[IntPtr]::Zero).ToInt32()
+    if ($needle -ne '') {
+        $index = [MdSmoke]::Raw($process.Id,$control).IndexOf($needle)
+        if ($index -lt 0) { throw "Missing font sample: $needle" }
+        [void][MdSmoke]::Send($control,177,[IntPtr]$index,[IntPtr]($index + 1))
+    }
     $bytes = [byte[]]::new(116)
     [BitConverter]::GetBytes(116).CopyTo($bytes, 0)
     $bytes = [MdSmoke]::Remote($process.Id, $control, 1082, [IntPtr]1, $bytes)
+    [void][MdSmoke]::Send($control,177,[IntPtr]$selection[0],[IntPtr]$selection[1])
+    [void][MdSmoke]::Remote($process.Id,$control,1246,[IntPtr]::Zero,$scroll)
+    $currentLine = [MdSmoke]::Send($control,206,[IntPtr]::Zero,[IntPtr]::Zero).ToInt32()
+    if ([Math]::Abs($currentLine - $firstLine) -gt 2) {
+        [void][MdSmoke]::Send($control,182,[IntPtr]::Zero,[IntPtr]($firstLine - $currentLine))
+    }
     return [Text.Encoding]::Unicode.GetString($bytes, 26, 64).TrimEnd([char]0)
 }
 function Read-Color($process, $control, [string]$needle, [int]$offset = 20) {
@@ -205,6 +242,16 @@ function Check-Viewport($process, $w, $control, [int]$dpi, [string]$label) {
     Assert ($bounds.top - $origin.y -eq $padding -and $origin.y + $parent.bottom - $bounds.bottom -eq $padding) "$label keeps vertical padding outside the native viewport"
     Assert ($format.top -eq 0 -and $format.bottom -eq $client.bottom) "$label native text area fills the viewport height (top=$($format.top), bottom=$($format.bottom), client=$($client.bottom))"
 }
+function Text-Point($process, $control, [int]$index) {
+    $bytes = [MdSmoke]::Remote($process.Id,$control,1062,[IntPtr]$index,[byte[]]::new(8),$true)
+    return @([BitConverter]::ToInt32($bytes,0), [BitConverter]::ToInt32($bytes,4))
+}
+function Read-Anchor($process, $control) {
+    $line = [MdSmoke]::Send($control,206,[IntPtr]::Zero,[IntPtr]::Zero).ToInt32()
+    $index = [MdSmoke]::Send($control,187,[IntPtr]$line,[IntPtr]::Zero).ToInt32() # EM_LINEINDEX
+    $point = Text-Point $process $control $index
+    return @($index,$point[1])
+}
 function Char-Point($process, $control, [int]$index) {
     [void][MdSmoke]::Send($control,177,[IntPtr]$index,[IntPtr]$index)
     [void][MdSmoke]::Send($control,183,[IntPtr]::Zero,[IntPtr]::Zero) # EM_SCROLLCARET
@@ -243,7 +290,7 @@ function Navigate($process, $w, [string]$renderNeedle, [string]$sourceNeedle, [i
     # cannot move this hit onto the following character.
     Mouse-At $view 515 @($point[0],($point[1] + 2))
     $selection = Read-Selection $process $source
-    Assert (([MdSmoke]::GetWindowLongPtrW($source,-16) -band 0x10000000) -ne 0 -and $selection[0] -eq $expected -and $selection[1] -eq $expected) "double-click maps $renderNeedle + $renderOffset to source offset $expected $label (actual $($selection -join ','))"
+    Assert (([MdSmoke]::GetWindowLongPtrW($source,-16) -band 0x10000000) -ne 0 -and $selection[0] -eq $expected -and $selection[1] -eq $expected) "double-click maps $renderNeedle + $renderOffset to source offset $expected $label (actual $($selection -join ','), point $($point -join ','))"
     $caret = [MdSmoke]::Remote($process.Id,$source,1062,[IntPtr]$expected,[byte[]]::new(8),$true)
     $rect = [MdSmoke+Rect]::new()
     $oldContext = [MdSmoke]::SetThreadDpiAwarenessContext([IntPtr](-4))
@@ -274,7 +321,7 @@ function Read-Table($process, $control, [string]$needle) {
     if ($position -lt 0) { throw "Missing native row start: $needle" }
     return [MdSmoke]::Table($process.Id,$control,$position)
 }
-$testDirectory = Join-Path $PSScriptRoot 'build\smoke'
+$testDirectory = Join-Path (Join-Path $PSScriptRoot 'build\smoke') ([Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $testDirectory | Out-Null
 $ini = Join-Path $testDirectory 'markdown-editor.ini'
 if (Test-Path -LiteralPath $ini) { Remove-Item -LiteralPath $ini }
@@ -314,10 +361,7 @@ try {
     Assert (([MdSmoke]::GetMenuItemCount($bar) -eq 2) -and ([MdSmoke]::GetMenuItemCount([MdSmoke]::GetSubMenu($bar, 0)) -eq 3) -and ([MdSmoke]::GetMenuItemCount($mode) -eq 4) -and ([MdSmoke]::GetMenuState($mode, 2, 1024) -band 2048)) 'six menu actions with a separator before Dark theme'
     Assert (([MdSmoke]::GetMenuState($mode, 201, 0) -band 8) -ne 0) 'existing file starts in View mode'
     Assert (([MdSmoke]::GetMenuState($mode, 203, 0) -band 8) -eq 0) 'missing theme setting defaults to Light'
-    $populated = [IO.File]::ReadAllText($ini)
-    $defaults = @('[theme.light]','background=#F5F3EE','text=#242424','link=#005BAE','muted=#62605C','code=#E8E5DE','table_border=#C1BFB9',
-        '[theme.dark]','background=#000000','text=#D0D0D0','link=#79B8FF','muted=#A0A0A0','code=#181818','table_border=#484848')
-    Assert (($defaults | Where-Object { -not $populated.Contains($_) }).Count -eq 0) 'first launch automatically populates all twelve palette defaults'
+    Assert (-not (Test-Path -LiteralPath $ini)) 'startup leaves missing settings absent'
     $timer = [Diagnostics.Stopwatch]::StartNew()
     foreach ($dark in @($false,$true,$false,$true,$false)) {
         $checked = ([MdSmoke]::GetMenuState($mode,203,0) -band 8) -ne 0
@@ -334,7 +378,7 @@ try {
         Assert ([BitConverter]::ToUInt32($row,44) -eq $border -and [BitConverter]::ToInt16($row,36) -eq 10) "native half-point table border (dark=$dark)"
     }
     $timer.Stop()
-    Write-Output "Ordinary document palette checks and four switches: $($timer.ElapsedMilliseconds) ms"
+    Write-Output "Ordinary document palette checks and four switches, including notification settling: $($timer.ElapsedMilliseconds) ms"
     Assert (-not [MdSmoke]::Content($w).StartsWith('*') -and [MdSmoke]::Content($source).Contains('**bold**')) 'theme changes preserve clean source and title'
     foreach ($dark in @($true,$false)) {
         Command $w 203
@@ -410,7 +454,7 @@ try {
     Assert ([MdSmoke]::Content($w).StartsWith('Untitled') -and (([MdSmoke]::GetWindowLongPtrW($source,-16) -band 0x10000000) -ne 0)) 'empty launch creates an untitled editor'
     [void][MdSmoke]::Text($source, 194, [IntPtr]1, "# New UTF-8`r`nλ")
     Post-Command $w 101
-    $newPath = Join-Path $testDirectory "new document without extension $PID"
+    $newPath = Join-Path $testDirectory ("new document without extension " + [Guid]::NewGuid().ToString("N"))
     Dialog-Path $blank $newPath
     for ($n=0; $n -lt 100 -and -not [IO.File]::Exists($newPath + '.md'); ++$n) { Start-Sleep -Milliseconds 50 }
     Assert ([IO.File]::Exists($newPath + '.md')) 'untitled Save dialog supplies .md extension'
@@ -469,100 +513,164 @@ try {
     [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
 
     $ini = Join-Path $testDirectory 'markdown-editor.ini'
-    [IO.File]::WriteAllText($ini, "; Keep this comment`r`n[font]`r`npath=C:\Windows\Fonts\arial.ttf`r`n[appearance]`r`ntheme=invalid`r`n", [Text.Encoding]::Unicode)
-    $fontApp = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
-    $processes.Add($fontApp)
-    $w = Wait-Window $fontApp
-    Start-Sleep -Milliseconds 300
-    Assert ((Read-Font $fontApp ([MdSmoke]::GetDlgItem($w,300))) -eq 'Arial') 'configured TTF applies to source text'
-    $renderedFont = Read-Font $fontApp ([MdSmoke]::GetDlgItem($w,301))
-    Assert ($renderedFont -eq 'Arial') "configured TTF applies to rendered text ($renderedFont)"
-    Assert (([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),203,0) -band 8) -eq 0) 'invalid theme setting defaults to Light'
+    $liveSettings = "; Keep live notes Ω`n[appearance]`ntheme=light`n[unrelated]`nkeep=original`n[font]`nedit=Arial`nprose=Segoe UI`ncode=Consolas`n[theme.light]`nbackground=#112233`ntext=#123456`nlink=#13579b`nmuted=#2468ac`ncode=#abcdef`ntable_border=#2468ac`n[theme.dark]`nbackground=#010203`ntext=#fedcba`nlink=#89abcd`nmuted=#765432`ncode=#102030`ntable_border=#14283c`n"
+    [IO.File]::WriteAllText($ini,$liveSettings,[Text.Encoding]::Unicode)
+    $live = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
+    $processes.Add($live)
+    $w = Wait-Window $live
+    Command $w 201
+    $source = [MdSmoke]::GetDlgItem($w,300)
+    $view = [MdSmoke]::GetDlgItem($w,301)
+    Assert ((Read-Font $live $source) -eq 'Arial' -and (Read-Font $live $view 'Quote sample') -eq 'Segoe UI' -and (Read-Font $live $view 'code sample') -eq 'Consolas') 'three independent installed font roles'
+    Check-Palette $live $w @(0x332211,0x563412,0x9B5713,0xAC6824,0xEFCDAB,0xAC6824) 'custom Light palette'
+    Assert ([IO.File]::ReadAllText($ini) -eq $liveSettings) 'startup leaves settings and comments untouched'
+    $rowBefore = Read-Table $live $view 'Grid header'
+    [void][MdSmoke]::Send($view,177,[IntPtr]5,[IntPtr]10)
+    $viewSelection = Read-Selection $live $view
+    $sourceState = Control-State $live $source
+    $changed = $liveSettings.Replace('prose=Segoe UI','prose=Courier New').Replace('code=Consolas','code=Arial').Replace('theme=light','theme=dark')
+    [IO.File]::WriteAllText($ini,$changed,[Text.Encoding]::Unicode)
+    Wait-Setting { (Read-Font $live $view 'Quote sample') -eq 'Courier New' } 'live preview font reflow'
+    Assert ((Read-Font $live $source) -eq 'Arial' -and (Read-Font $live $view 'code sample') -eq 'Arial') 'prose and code changes leave source font independent'
+    Assert (((Read-Selection $live $view) -join ',') -eq ($viewSelection -join ',') -and (Control-State $live $source) -eq $sourceState) 'live preview update preserves selections and hidden source position'
+    Assert (([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),203,0) -band 8) -ne 0) 'external theme updates menu checkmark'
+    $rowAfter = Read-Table $live $view 'Grid header'
+    Assert ([BitConverter]::ToInt32($rowBefore,28) -ne [BitConverter]::ToInt32($rowAfter,28)) 'font change remeasures table widths'
+    Check-Palette $live $w @(0x030201,0xBADCFE,0xCDAB89,0x325476,0x302010,0x3C2814) 'live Dark palette'
+
+    # A preview modification flag witnesses a stream rebuild, without adding
+    # any instrumentation to the application. Ignored changes must retain it.
+    [void][MdSmoke]::Send($view,185,[IntPtr]1,[IntPtr]::Zero)
+    $changed = $changed.Replace('text=#123456','text=#654321') + '; comment only change' + "`n"
+    [IO.File]::WriteAllText($ini,$changed,[Text.Encoding]::Unicode)
+    Start-Sleep -Milliseconds 450
+    Assert ([MdSmoke]::Send($view,184,[IntPtr]::Zero,[IntPtr]::Zero) -ne [IntPtr]::Zero) 'comments and inactive palette changes skip preview rebuild'
     Command $w 203
-    Assert ((Read-Font $fontApp ([MdSmoke]::GetDlgItem($w,300))) -eq 'Arial' -and (Read-Font $fontApp ([MdSmoke]::GetDlgItem($w,301))) -eq 'Arial') 'dynamic theme preserves custom fonts in both controls'
-    $settings = [IO.File]::ReadAllText($ini)
-    Assert ($settings.Contains('theme=dark') -and $settings.Contains('path=C:\Windows\Fonts\arial.ttf') -and $settings.Contains('; Keep this comment')) 'theme saves immediately and preserves UTF-16 INI font settings and comments'
-    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
-    [IO.File]::WriteAllText($ini, $settings.Replace('C:\Windows\Fonts\arial.ttf','missing.ttf'), [Text.Encoding]::Unicode)
-    $fallback = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru
-    $processes.Add($fallback)
-    $w = Wait-Window $fallback
-    Assert ((Read-Font $fallback ([MdSmoke]::GetDlgItem($w,300))) -eq 'Consolas') 'missing TTF falls back gracefully'
-    Assert (([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),203,0) -band 8) -ne 0 -and (Read-Color $fallback ([MdSmoke]::GetDlgItem($w,300)) '' ) -eq 0xD0D0D0) 'saved Dark theme applies at startup'
-    $lockedSettings = [IO.File]::Open($ini,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    Assert ([IO.File]::ReadAllText($ini).Contains('theme=light') -and [IO.File]::ReadAllText($ini).Contains('; Keep live notes Ω')) 'theme menu persists immediately and preserves Unicode notes'
+    [void][MdSmoke]::Send($view,185,[IntPtr]1,[IntPtr]::Zero)
+    Start-Sleep -Milliseconds 450
+    Assert ([MdSmoke]::Send($view,184,[IntPtr]::Zero,[IntPtr]::Zero) -ne [IntPtr]::Zero) 'own theme write skips duplicate rendering'
+
+    $sourceOnly = [IO.File]::ReadAllText($ini).Replace('edit=Arial','edit=Segoe UI')
+    [IO.File]::WriteAllText($ini,$sourceOnly,[Text.Encoding]::Unicode)
+    Wait-Setting { (Read-Font $live $source) -eq 'Segoe UI' } 'source-only font reload in View'
+    Assert ([MdSmoke]::Send($view,184,[IntPtr]::Zero,[IntPtr]::Zero) -ne [IntPtr]::Zero) 'source font change skips preview rendering and table measurement'
+    Command $w 200
+    [void][MdSmoke]::Send($source,177,[IntPtr](-1),[IntPtr](-1))
+    [void][MdSmoke]::Text($source,194,[IntPtr]1,' live pending redo')
+    [void][MdSmoke]::Send($source,199,[IntPtr]::Zero,[IntPtr]::Zero)
+    [void][MdSmoke]::Send($source,177,[IntPtr]5,[IntPtr]12)
+    $selectionBefore = Read-Selection $live $source
+    $previewBefore = [MdSmoke]::Raw($live.Id,$view)
+    $changed = [IO.File]::ReadAllText($ini).Replace('edit=Segoe UI','edit=Courier New').Replace('prose=Courier New','prose=Arial')
+    [IO.File]::WriteAllText($ini,$changed,[Text.Encoding]::Unicode)
+    Wait-Setting { (Read-Font $live $source) -eq 'Courier New' } 'live source font changes in Edit'
+    Assert (((Read-Selection $live $source) -join ',') -eq ($selectionBefore -join ',') -and [MdSmoke]::Raw($live.Id,$view) -eq $previewBefore -and (Read-Font $live $view 'Quote sample') -eq 'Courier New') 'font reload preserves selection and defers hidden preview formatting'
+    [void][MdSmoke]::Send($source,1108,[IntPtr]::Zero,[IntPtr]::Zero)
+    Assert ([MdSmoke]::Content($source).Contains('live pending redo') -and [MdSmoke]::Content($w).StartsWith('*')) 'redo and dirty state survive live fonts'
+    Assert ((Read-Font $live $source 'live pending redo') -eq 'Courier New') 'redo retains the live source font'
+    [void][MdSmoke]::Send($source,199,[IntPtr]::Zero,[IntPtr]::Zero)
+    Assert (-not [MdSmoke]::Content($source).Contains('live pending redo')) 'undo survives live fonts'
+    Command $w 201
+    Assert ((Read-Font $live $view 'Quote sample') -eq 'Arial') 'View applies deferred preview fonts'
+
+    $invalid = $changed.Replace('background=#112233','background=').Replace('text=#654321','text=invalid').Replace('link=#13579b','link=#123').Replace('muted=#2468ac','muted=').Replace('code=#abcdef','code=#11223344').Replace('table_border=#2468ac','table_border=invalid').Replace('edit=Courier New','edit=No such font Ω').Replace('prose=Arial','prose=').Replace('theme=light','theme=unknown')
+    [IO.File]::WriteAllText($ini,$invalid,[Text.Encoding]::Unicode)
+    Wait-Setting { (Read-Font $live $source) -eq 'Consolas' } 'invalid and empty fonts fall back live'
+    Check-Palette $live $w @(0x00008B,0xB469FF,0xB469FF,0xB469FF,0x00008B,0xB469FF) 'per-field error palette'
+    Assert ((Read-Font $live $view 'Quote sample') -eq 'Consolas' -and ([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),203,0) -band 8) -eq 0) 'invalid prose and theme use Consolas and Light'
+    Assert ([IO.File]::ReadAllText($ini) -eq $invalid) 'reload never repairs invalid entries'
+    [IO.File]::WriteAllText($ini,$changed,[Text.Encoding]::Unicode)
+    Wait-Setting { (Read-Font $live $source) -eq 'Courier New' } 'corrected values recover automatically'
+
+    # Replacement saves, rapid bursts, and a temporary exclusive writer.
+    $replacement = Join-Path $testDirectory 'replacement.ini'
+    [IO.File]::WriteAllText($replacement,$changed.Replace('edit=Courier New','edit=Arial'),[Text.UTF8Encoding]::new($true))
+    [IO.File]::Move($replacement,$ini,$true)
+    Wait-Setting { (Read-Font $live $source) -eq 'Arial' } 'rename replacement save reloads'
+    $locked = [IO.File]::Open($ini,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
     try {
-        Post-Command $w 203
-        $dialog = Wait-Window $fallback '#32770'
-        Assert (([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),203,0) -band 8) -eq 0 -and (Read-Color $fallback ([MdSmoke]::GetDlgItem($w,300)) '') -eq 0x242424) 'failed preference write retains selected Light theme for this session'
-        $messages = [Collections.Generic.List[string]]::new()
-        [void][MdSmoke]::EnumChildWindows($dialog, {param($child,$unused) $messages.Add([MdSmoke]::Content($child)); return $true}, [IntPtr]::Zero)
-        Assert (($messages -join ' ').Contains('could not be saved')) 'preference write failure displays a clear persistence error'
-        Dismiss-Error $dialog
-    } finally { $lockedSettings.Dispose() }
-    Assert ([IO.File]::ReadAllText($ini).Contains('theme=dark')) 'failed preference write preserves previous stored preference'
-    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+        $bytes = [Text.Encoding]::UTF8.GetBytes($changed)
+        $locked.SetLength(0); $locked.Write($bytes,0,$bytes.Length); $locked.Flush($true)
+        Start-Sleep -Milliseconds 1600
+        Assert ((Read-Font $live $source) -eq 'Arial' -and [MdSmoke]::Find($live.Id,'#32770') -eq [IntPtr]::Zero) 'sharing retries retain current appearance without dialogs'
+    } finally { $locked.Dispose() }
+    Wait-Setting { (Read-Font $live $source) -eq 'Courier New' } 'backoff recovers after writer releases file'
+    for ($burst=0; $burst -lt 8; ++$burst) {
+        [IO.File]::WriteAllText($ini,$changed.Replace('edit=Courier New',$(if ($burst -eq 7) { 'edit=Arial' } else { 'edit=Consolas' })),[Text.UTF8Encoding]::new($false))
+        Start-Sleep -Milliseconds 15
+    }
+    Wait-Setting { (Read-Font $live $source) -eq 'Arial' } 'debounced save burst uses final snapshot'
 
-    $partialSettings = "; Preserve palette notes Ω`r`n[font]`r`npath=missing.ttf`r`n[appearance]`r`ntheme=dark`r`n[unrelated]`r`nkeep=original`r`n[theme.light]`r`nBACKGROUND=  #aBcDeF `t`r`ntext=#GG0011`r`nlink=#123`r`nmuted=`r`ncode=#11223344`r`ntable_border=#12345Z`r`n[theme.dark]`r`ntext=#123456`r`nlink=#ff0000`r`n"
-    [IO.File]::WriteAllText($ini,$partialSettings,[Text.Encoding]::Unicode)
-    $partial = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
-    $processes.Add($partial)
-    $w = Wait-Window $partial
-    Command $w 201
-    Check-Palette $partial $w @(0,0x563412,0x0000FF,0xA0A0A0,0x181818,0x484848) 'partial Dark palette'
-    Command $w 203
-    Check-Palette $partial $w @(0xEFCDAB,0x242424,0xAE5B00,0x5C6062,0xDEE5E8,0xB9BFC1) 'invalid Light entries fall back individually'
-    $populated = [IO.File]::ReadAllText($ini)
-    Assert ($populated.Contains('background=#000000') -and $populated.Contains('muted=#A0A0A0') -and $populated.Contains('code=#181818')) 'partial palettes gain only missing defaults'
-    Assert ($populated.Contains('text=#GG0011') -and $populated.Contains('link=#123') -and $populated.Contains("muted=`r`n") -and $populated.Contains('code=#11223344')) 'invalid and empty color entries remain unchanged'
-    Assert ($populated.Contains('table_border=#12345Z') -and $populated.Contains('table_border=#484848')) 'invalid table border remains editable and missing border gains default'
-    Assert ($populated.Contains('; Preserve palette notes Ω') -and $populated.Contains('path=missing.ttf') -and $populated.Contains('keep=original') -and $populated.Contains("BACKGROUND=  #aBcDeF `t")) 'population and toggling preserve comments, fonts, unrelated settings, and existing colors'
-    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+    $second = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
+    $processes.Add($second)
+    $secondWindow = Wait-Window $second
+    $secondSource = [MdSmoke]::GetDlgItem($secondWindow,300)
+    Command $secondWindow 201
+    [IO.File]::WriteAllText($ini,$changed,[Text.UTF8Encoding]::new($false))
+    Wait-Setting { (Read-Font $live $source) -eq 'Courier New' -and (Read-Font $second $secondSource) -eq 'Courier New' } 'multiple windows watch the same INI'
+    Post-Command $w 100
+    $dialog = Wait-Window $live '#32770'
+    [IO.File]::WriteAllText($ini,$changed.Replace('edit=Courier New','edit=Arial'),[Text.UTF8Encoding]::new($false))
+    Wait-Setting { (Read-Font $live $source) -eq 'Arial' } 'live reload continues inside native Open dialog'
+    [void][MdSmoke]::PostMessage($dialog,273,[IntPtr]2,[IntPtr]::Zero)
+    Start-Sleep -Milliseconds 100
+    Remove-Item -LiteralPath $ini
+    Wait-Setting { (Read-Font $live $source) -eq 'Consolas' -and (Read-Font $second $secondSource) -eq 'Consolas' } 'deleting INI restores missing-field defaults in both windows'
+    Assert (-not (Test-Path -LiteralPath $ini)) 'deleted settings stay absent while running'
 
-    $customSettings = "[appearance]`r`ntheme=light`r`n[theme.light]`r`nbackground=#112233`r`ntext=#123456`r`nlink=#13579b`r`nmuted=#2468ac`r`ncode=#abcdef`r`ntable_border=#2468ac`r`n[theme.dark]`r`nbackground=#010203`r`ntext=#fedcba`r`nlink=#89abcd`r`nmuted=#765432`r`ncode=#102030`r`ntable_border=#14283c`r`n"
-    [IO.File]::WriteAllText($ini,$customSettings,[Text.Encoding]::ASCII)
-    $custom = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
-    $processes.Add($custom)
-    $w = Wait-Window $custom
-    Command $w 201
-    Check-Palette $custom $w @(0x332211,0x563412,0x9B5713,0xAC6824,0xEFCDAB,0xAC6824) 'custom Light palette'
-    Command $w 203
-    Check-Palette $custom $w @(0x030201,0xBADCFE,0xCDAB89,0x325476,0x302010,0x3C2814) 'custom Dark palette'
-    # Editing the INI during a session must not reload colors on theme changes.
-    $changedSettings = [IO.File]::ReadAllText($ini).Replace('text=#fedcba','text=#c0ffee')
-    [IO.File]::WriteAllText($ini,$changedSettings,[Text.Encoding]::ASCII)
-    Command $w 203
-    Command $w 203
-    Check-Palette $custom $w @(0x030201,0xBADCFE,0xCDAB89,0x325476,0x302010,0x3C2814) 'session keeps startup colors'
-    Assert ([IO.File]::ReadAllText($ini).Contains('text=#c0ffee')) 'theme toggle writes only appearance theme and preserves manual color edits'
-    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
-    $restarted = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
-    $processes.Add($restarted)
-    $w = Wait-Window $restarted
-    Command $w 201
-    Assert (([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),203,0) -band 8) -ne 0) 'custom palette restart retains selected Dark theme'
-    Check-Palette $restarted $w @(0x030201,0xEEFFC0,0xCDAB89,0x325476,0x302010,0x3C2814) 'restart applies manually edited color'
-    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+    # Close repair reads the latest disk snapshot even with a debounce pending.
+    $repairInput = "; Last notes Ω`n[appearance]`ntheme=dark`n[font]`nedit=Arial`nprose=`n[unrelated]`nkeep=latest`n[theme.light]`ntext=invalid`n[theme.dark]`ntext=#123456`n"
+    [IO.File]::WriteAllText($ini,$repairInput,[Text.UnicodeEncoding]::new($true,$true))
+    [void][MdSmoke]::Send($secondWindow,16,[IntPtr]::Zero,[IntPtr]::Zero)
+    Assert ($second.WaitForExit(3000)) 'shutdown drains pending notifications'
+    $repaired = [IO.File]::ReadAllText($ini)
+    $repairedBytes = [IO.File]::ReadAllBytes($ini)
+    Assert ($repaired.Contains('; Last notes Ω') -and $repaired.Contains('keep=latest') -and $repaired.Contains('theme=dark') -and $repaired.Contains('edit=Arial') -and $repaired.Contains('text=#123456') -and $repaired.Contains('prose=Segoe UI') -and $repaired.Contains('text=#242424') -and $repairedBytes[0] -eq 254 -and $repairedBytes[1] -eq 255 -and -not $repaired.Contains("`r")) 'close repairs both palettes and fonts while preserving valid choices, comments, UTF-16 BE and LF'
+    Command $w 200
+    [void][MdSmoke]::Text($source,194,[IntPtr]1,' cancel repair')
+    [IO.File]::WriteAllText($ini,$invalid,[Text.Encoding]::Unicode)
+    Post-Command $w 102
+    $dialog = Wait-Window $live '#32770'
+    [void][MdSmoke]::PostMessage($dialog,1126,[IntPtr]2,[IntPtr]::Zero)
+    Start-Sleep -Milliseconds 250
+    Assert ([IO.File]::ReadAllText($ini) -eq $invalid -and -not $live.HasExited) 'canceled close does no repair'
+    Post-Command $w 102
+    $dialog = Wait-Window $live '#32770'
+    [void][MdSmoke]::PostMessage($dialog,1126,[IntPtr]7,[IntPtr]::Zero)
+    Assert ($live.WaitForExit(3000)) 'confirmed close repairs and exits'
 
-    # A readable but locked partial INI forces failure while adding defaults.
-    [IO.File]::WriteAllText($ini,"; Locked startup`r`n[theme.light]`r`ntext=#123456`r`n",[Text.Encoding]::ASCII)
-    $lockedStartup = [IO.File]::Open($ini,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    # Structurally invalid snapshots use all error settings and keep a backup.
+    $badText = "; broken Ω`r`n[font`r`nedit=Arial`r`n"
+    [IO.File]::WriteAllText($ini,$badText,[Text.UTF8Encoding]::new($true))
+    $broken = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
+    $processes.Add($broken)
+    $w = Wait-Window $broken
+    Command $w 201
+    $source = [MdSmoke]::GetDlgItem($w,300)
+    Check-Palette $broken $w @(0x00008B,0xB469FF,0xB469FF,0xB469FF,0x00008B,0xB469FF) 'unparseable INI error palette'
+    Assert ((Read-Font $broken $source) -eq 'Consolas') 'unparseable INI uses Consolas'
+    [IO.File]::WriteAllText($ini,$liveSettings,[Text.UTF8Encoding]::new($true))
+    Wait-Setting { (Read-Font $broken $source) -eq 'Arial' } 'structural errors recover without restarting'
+    [IO.File]::WriteAllText($ini,$badText,[Text.UTF8Encoding]::new($true))
+    Wait-Setting { (Read-Font $broken $source) -eq 'Consolas' } 'structural errors become visible during session'
+    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+    $backup = Get-ChildItem -LiteralPath $testDirectory -Filter "markdown-editor.ini.invalid-$($broken.Id)-*.bak"
+    Assert ($backup.Count -eq 1 -and [IO.File]::ReadAllText($backup[0].FullName) -eq $badText -and [IO.File]::ReadAllText($ini).Contains('prose=Segoe UI')) 'malformed close backs up original and writes complete defaults'
+
+    [IO.File]::WriteAllText($ini,"; Locked close`n[theme.light]`ntext=#123456`n",[Text.Encoding]::UTF8)
+    $unwritable = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru
+    $processes.Add($unwritable)
+    $w = Wait-Window $unwritable
+    Start-Sleep -Milliseconds 200
+    $lockedClose = [IO.File]::Open($ini,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     try {
-        $unwritable = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru
-        $processes.Add($unwritable)
-        $w = Wait-Window $unwritable
+        Post-Command $w 102
         $dialog = Wait-Window $unwritable '#32770'
-        $messages = [Collections.Generic.List[string]]::new()
-        [void][MdSmoke]::EnumChildWindows($dialog,{param($child,$unused) $messages.Add([MdSmoke]::Content($child)); return $true},[IntPtr]::Zero)
-        Assert (($messages -join ' ').Contains('Missing theme colors could not be saved') -and ($messages -join ' ').Contains($ini)) 'startup shows one palette persistence error after creating the window'
-        $source = [MdSmoke]::GetDlgItem($w,300)
-        Assert ((Read-Color $unwritable $source '') -eq 0x563412) 'startup persistence failure retains loaded custom color'
-        Check-Background $source 0xEEF3F5 'startup persistence failure retains default background'
         Dismiss-Error $dialog
-        Start-Sleep -Milliseconds 150
-        Assert ([MdSmoke]::Find($unwritable.Id,'#32770') -eq [IntPtr]::Zero -and -not $unwritable.HasExited) 'dismissing the single startup error leaves the editor usable'
-    } finally { $lockedStartup.Dispose() }
-    Assert ([IO.File]::ReadAllText($ini) -eq "; Locked startup`r`n[theme.light]`r`ntext=#123456`r`n") 'failed startup writes preserve existing configuration'
-    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+        Assert ($unwritable.WaitForExit(3000)) 'failed close repair reports once and still exits'
+    } finally { $lockedClose.Dispose() }
+    Assert ([IO.File]::ReadAllText($ini) -eq "; Locked close`n[theme.light]`ntext=#123456`n") 'failed repair leaves original untouched'
     Remove-Item -LiteralPath $ini
     $navigationPath = Join-Path $testDirectory 'navigation.md'
     $navigationText = @'
@@ -851,11 +959,22 @@ Last source line Ω
     $viewState = Control-State $large $view
     $sourceState = Control-State $large $source
     $timer.Restart()
-    Command $w 203
+    Command $w 203 -SkipSettle
     $timer.Stop()
+    Start-Sleep -Milliseconds 180
     Write-Output "Large document ($($largeText.Length) characters) View theme switch: $($timer.ElapsedMilliseconds) ms"
     Assert ((Control-State $large $view) -eq $viewState -and (Control-State $large $source) -eq $sourceState) 'large document theme switch preserves selections and nonzero scroll positions in both controls'
     Assert (-not [MdSmoke]::Content($w).StartsWith('*')) 'large document theme switch leaves source clean'
+    $viewAnchor = Read-Anchor $large $view
+    $sourceAnchor = Read-Anchor $large $source
+    $viewSelection = Read-Selection $large $view
+    $sourceSelection = Read-Selection $large $source
+    [IO.File]::WriteAllText($ini,"[appearance]`ntheme=dark`n[font]`nedit=Arial`nprose=Courier New`ncode=Arial`n",[Text.UTF8Encoding]::new($false))
+    Wait-Setting { (Read-Font $large $view 'Paragraph') -eq 'Courier New' } 'large preview reflows with live fonts'
+    $viewPoint = Text-Point $large $view $viewAnchor[0]
+    $sourcePoint = Text-Point $large $source $sourceAnchor[0]
+    Assert ([Math]::Abs($viewPoint[1] - $viewAnchor[1]) -le 2 -and [Math]::Abs($sourcePoint[1] - $sourceAnchor[1]) -le 2) "live font changes retain both visible text anchors across reflow (view $($viewAnchor -join ',') -> $($viewPoint -join ','); source $($sourceAnchor -join ',') -> $($sourcePoint -join ','))"
+    Assert (((Read-Selection $large $view) -join ',') -eq ($viewSelection -join ',') -and ((Read-Selection $large $source) -join ',') -eq ($sourceSelection -join ',') -and -not [MdSmoke]::Content($w).StartsWith('*')) 'large live fonts preserve both selections and clean state'
     Navigate $large $w 'bold' 'bold' 3000 'beyond the 16-bit character range' 3000 2 2
     [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
     Remove-Item -LiteralPath $ini

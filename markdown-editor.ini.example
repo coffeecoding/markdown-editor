@@ -3,8 +3,10 @@
 [appearance]
 theme=light
 
-; Restart after editing document colors. Use #RRGGBB (case-insensitive).
-; Missing entries are added on launch. Invalid entries use their defaults.
+; Saved changes apply live after 150 ms. Use #RRGGBB (case-insensitive).
+; Missing entries use built-in defaults while running.
+; Invalid background/code colors use #8B0000; other colors use #FF69B4.
+; A confirmed close repairs missing/invalid entries to normal defaults.
 ; table_border is a fixed RGB color, independent of text and background.
 [theme.light]
 background=#F5F3EE
@@ -22,8 +24,10 @@ muted=#A0A0A0
 code=#181818
 table_border=#484848
 
-; Restart after changing the font setting.
-; A relative path is resolved beside the executable. Do not add quotes.
-; Remove this setting (or the INI file) to restore the default fonts.
+; Installed Windows font families; saved changes apply live.
+; Independent source, preview prose, and preview code fonts. Sizes are fixed.
+; Missing entries use these defaults; invalid/empty families use Consolas.
 [font]
-path=fonts\YourFont.ttf
+edit=Consolas
+prose=Segoe UI
+code=Consolas

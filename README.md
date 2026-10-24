@@ -14,7 +14,7 @@ browser engine, extra runtime, installer, or startup network access.
 ## Run
 
 Copy `markdown-editor.exe` and `MD4C-LICENSE.txt` from [release/](release/) into
-a permanent folder. The required distribution is about **366 KiB**.
+a permanent folder. The required distribution is about **390 KiB**.
 
 The ivory quill icon is embedded in the executable for Explorer, the taskbar,
 Alt+Tab, and the title bar. Ten sizes from 16 to 256 pixels keep it clear at
@@ -87,24 +87,58 @@ normal builds use the checked-in ICO and require no artwork tools.
 
 The renderer checks rebuild Release; `-Benchmark` also reports mapping and table
 layout memory, render timings, native cell measurement, and cached table resizing.
-The smoke suite exercises native windows, file handling, themes, undo/redo,
-Unicode, tables, DPI handlers, and exact source navigation. Generated
+The native settings checks cover parsing, repair, encodings, file locks, directory
+notification overflow, and shutdown. The smoke suite exercises native windows,
+file handling, live settings, undo/redo, Unicode, tables, DPI handlers, and exact
+source navigation. Generated
 files stay under ignored `build/`. Icon extraction and DPI-specific window icon
 sizes are checked too. Physical mouse interaction, visible caret and shell icon
-appearance, and real mixed-monitor movement still need manual checks.
+appearance, visible fallback colors/font reflow, and real mixed-monitor movement
+still need manual checks. Acceptance of non-ASCII family names is checked when
+such a font is installed on the test machine.
 Viewport checks also cover outer padding when scrolling tables, resizing, and
 showing or hiding the horizontal scrollbar.
 
 ## Settings and file handling
 
-**Mode → Dark theme** switches and saves the theme immediately. Colors and an
-optional private TTF font are configured in `markdown-editor.ini` beside the
-executable; see [the configuration example](markdown-editor.ini.example).
-The app fills in missing palette defaults. Restart after changing colors or
-fonts. The executable's folder must be writable to persist settings.
-Table borders have an independent `table_border` RGB setting, defaulting to
-`#C1BFB9` in Light and `#484848` in Dark. Changing text or background colors does
-not recompute this setting; invalid entries use the corresponding default.
+**Mode → Dark theme** switches and saves the theme immediately. Edit
+`markdown-editor.ini` beside the executable to change colors, installed Windows
+font families, or the selected theme; see [the configuration example](markdown-editor.ini.example).
+Saved changes apply live after a 150 ms debounce, including replacement saves
+and changes made while a native dialog is open. Each window watches the same
+file without idle polling. Temporary sharing locks retain the current appearance
+and retry with a 100 ms to one-second backoff.
+
+The independent font settings are `[font] edit=Consolas`, `prose=Segoe UI`, and
+`code=Consolas`. Font sizes remain fixed. Family names are checked with Windows
+font enumeration; there is no private font loading. Both palettes keep their
+own `background`, `text`, `link`, `muted`, `code`, and `table_border` RGB settings.
+Table borders default to `#C1BFB9` in Light and `#484848` in Dark, independently
+of the other colors.
+
+Missing settings use their normal defaults, with Light as the default theme.
+Present-but-empty or invalid background/code colors show dark red (`#8B0000`);
+invalid text/link/muted/border colors show hot pink (`#FF69B4`). Invalid font
+families use Consolas; an invalid theme uses Light. A structurally unparseable
+INI uses all error colors and Consolas. Correcting the file restores the
+configured appearance automatically. Font changes preserve visible text anchors
+across reflow; color changes retain pixel scrolling. Hidden preview rendering
+waits until View is requested.
+
+Settings accept UTF-8 (with or without BOM) and BOM-marked UTF-16 LE/BE,
+case-insensitive section/key names, surrounding whitespace, and semicolon comment
+lines. Duplicate keys use the last occurrence. Non-comment lines must be a
+`[section]` or a nonempty `key=value` inside a section. Values have no quoting
+or inline-comment syntax.
+
+Startup and reload never populate or repair the INI. After a confirmed close,
+the app rereads the latest file and atomically repairs missing or invalid theme,
+font, and palette settings to normal defaults, preserving valid choices,
+comments, unrelated entries, encoding/BOM, and existing line endings. A malformed
+file is first copied to a unique `markdown-editor.ini.invalid-*.bak` beside it,
+then replaced with complete defaults. Canceling close performs no repair. A
+failed repair reports once, retains the original, and allows closing. The
+executable's folder must be writable to persist settings or create backups.
 
 Markdown source is always authoritative. Saves preserve supported encodings
 (UTF-8 and UTF-16 with BOM) and newline conventions; failed saves retain unsaved
@@ -134,7 +168,7 @@ source. Other Markdown extensions are unsupported; code is not syntax-highlighte
 
 On the development machine, the existing large/dense renderer benchmarks remain
 about 8/14 ms with unchanged mapping memory. The table workload (80 tables,
-720 rows, 2,880 cells) takes about 162 ms to render, dominated by native formatted
+720 rows, 2,880 cells) takes about 166 ms to render, dominated by native formatted
 cell measurement, and 9 ms to resize from cached widths. Its retained table
 metadata occupies 8,640 bytes (9,424 allocated), in addition to source mapping.
 These timings depend on fonts and hardware; run the benchmark for local results.

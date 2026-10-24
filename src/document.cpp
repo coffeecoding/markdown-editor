@@ -65,17 +65,33 @@ std::string ToUtf8(const std::wstring& text)
     return result;
 }
 
-bool ReadDocument(const std::wstring& path, std::wstring& text, FileFormat& format, std::wstring& error)
+bool ReadDocument(const std::wstring& path, std::wstring& text, FileFormat& format, std::wstring& error,
+                  bool keepNewlines, unsigned long* ioError)
 {
-    Handle file{CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
-    if (file.value == INVALID_HANDLE_VALUE) { error = SystemError(GetLastError()); return false; }
+    if (ioError) *ioError = ERROR_SUCCESS;
+    // Deny in-place writes for a coherent snapshot, while allowing an editor
+    // to atomically replace the pathname. This handle retains the old bytes.
+    Handle file{CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+    if (file.value == INVALID_HANDLE_VALUE) {
+        const DWORD code = GetLastError();
+        if (ioError) *ioError = code;
+        error = SystemError(code); return false;
+    }
     LARGE_INTEGER length{};
-    if (!GetFileSizeEx(file.value, &length)) { error = SystemError(GetLastError()); return false; }
+    if (!GetFileSizeEx(file.value, &length)) {
+        const DWORD code = GetLastError();
+        if (ioError) *ioError = code;
+        error = SystemError(code); return false;
+    }
     if (length.QuadPart > MaxFileBytes) { error = L"This first version opens files up to 32 MiB."; return false; }
     std::string bytes(static_cast<size_t>(length.QuadPart), 0);
     DWORD read = 0;
-    if (!ReadFile(file.value, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) || read != bytes.size()) {
-        error = L"Could not read the complete file. " + SystemError(GetLastError()); return false;
+    const BOOL readOkay = ReadFile(file.value, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr);
+    if (!readOkay || read != bytes.size()) {
+        const DWORD code = readOkay ? ERROR_HANDLE_EOF : GetLastError();
+        if (ioError) *ioError = code;
+        error = L"Could not read the complete file. " + SystemError(code); return false;
     }
     format = {};
     if (bytes.size() >= 2 && ((static_cast<unsigned char>(bytes[0]) == 0xff && static_cast<unsigned char>(bytes[1]) == 0xfe) ||
@@ -109,7 +125,7 @@ bool ReadDocument(const std::wstring& path, std::wstring& text, FileFormat& form
     }
     if (lf > crlf && lf >= cr) format.newline = L"\n";
     else if (cr > crlf && cr > lf) format.newline = L"\r";
-    text = NormalizeNewlines(text);
+    if (!keepNewlines) text = NormalizeNewlines(text);
     return true;
 }
 
@@ -152,15 +168,25 @@ bool WriteDocument(const std::wstring& path, const std::wstring& text, const Fil
         error = L"Could not write the complete file. " + SystemError(writeError); return false;
     }
     bool replaced = false;
-    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        replaced = ReplaceFileW(path.c_str(), temporary.c_str(), nullptr, 0, nullptr, nullptr) != FALSE;
-    } else {
-        replaced = MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != FALSE;
+    DWORD replaceError = ERROR_SUCCESS;
+    for (unsigned attempt = 0; attempt < 5; ++attempt) {
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            replaced = ReplaceFileW(path.c_str(), temporary.c_str(), nullptr, 0, nullptr, nullptr) != FALSE;
+        } else {
+            replaced = MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != FALSE;
+        }
+        if (replaced) break;
+        replaceError = GetLastError();
+        // Filesystem filters can briefly retain a just-closed file. Keep the
+        // flushed temporary and original intact while retrying the rename,
+        // with at most 150 ms spent here, only during an explicit write.
+        if (attempt == 4 || (replaceError != ERROR_UNABLE_TO_REMOVE_REPLACED &&
+            replaceError != ERROR_SHARING_VIOLATION && replaceError != ERROR_LOCK_VIOLATION)) break;
+        Sleep(10u << attempt);
     }
     if (!replaced) {
-        const DWORD code = GetLastError();
         DeleteFileW(temporary.c_str());
-        error = SystemError(code); return false;
+        error = SystemError(replaceError); return false;
     }
     return true;
 }
