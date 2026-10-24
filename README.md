@@ -188,6 +188,8 @@ These timings depend on fonts and hardware; run the benchmark for local results.
 ## Roadmap
 
 - [x] Table rendering
+- [ ] Text search via Ctrl+F
+  - [ ] Fuzzy search support
 - [ ] Recent files
 - [x] Scroll-wheel zoom
 - [x] Application icon
