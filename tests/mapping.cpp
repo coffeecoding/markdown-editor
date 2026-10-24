@@ -1,6 +1,6 @@
 // Include the renderer to inspect temporary checkpoint storage without adding
 // instrumentation or a testing interface to the shipped executable.
-#include "../markdown.cpp"
+#include "../src/markdown.cpp"
 #include <richedit.h>
 #include <chrono>
 #include <cstdio>

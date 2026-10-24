@@ -4,7 +4,7 @@ string(REPLACE "/O2" "/O1" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
 string(REPLACE "/O2" "/O1" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
 
 # Separate, opt-in native checks; nothing is added to the shipped application.
-add_executable(mapping-checks mapping.cpp ../document.cpp
+add_executable(mapping-checks mapping.cpp ../src/document.cpp
     ../third_party/md4c/md4c.c ../third_party/md4c/entity.c)
 target_compile_features(mapping-checks PRIVATE cxx_std_17)
 target_compile_definitions(mapping-checks PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN
