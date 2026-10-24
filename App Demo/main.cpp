@@ -12,6 +12,7 @@
 #include "markdown.h"
 #include <algorithm>
 #include <cstring>
+#include <cwctype>
 #include <new>
 #include <string>
 #include <vector>
@@ -23,6 +24,9 @@ constexpr int EditId = 200, ViewId = 201, ToggleId = 202;
 constexpr int DarkThemeId = 203;
 constexpr int SourceId = 300, PreviewId = 301;
 constexpr LONG TextLimit = 32 * 1024 * 1024;
+// windows.h defines the standard EDIT message under the same name. Use Rich
+// Edit's full-width POINTL variant, which also works beyond 65,535 characters.
+constexpr UINT RichEditCharFromPos = WM_USER + 39; // EM_CHARFROMPOS
 
 struct Position {
     CHARRANGE selection{};
@@ -57,8 +61,11 @@ struct App {
     UINT dpi = 96;
     UINT richEditBaseDpi = 96;
     std::wstring path, savedSource, privateFontPath, customFamily, iniPath;
+    std::wstring settingsError;
     FileFormat format;
+    ThemePalette lightPalette = Palette(false), darkPalette = Palette(true);
     RenderOptions rendering;
+    SourceMap previewMapping;
 
     ~App() { if (!privateFontPath.empty()) RemoveFontResourceExW(privateFontPath.c_str(), FR_PRIVATE, nullptr); }
 
@@ -85,6 +92,52 @@ struct App {
         SetWindowTextW(window, ((dirty ? L"*" : L"") + filename + L" — Markdown Editor").c_str());
     }
 
+    ThemePalette LoadPalette(bool dark)
+    {
+        ThemePalette palette = Palette(dark);
+        const wchar_t* section = dark ? L"theme.dark" : L"theme.light";
+        struct Color { const wchar_t* key; COLORREF ThemePalette::* field; };
+        const Color colors[] = {{L"background", &ThemePalette::background}, {L"text", &ThemePalette::text},
+            {L"link", &ThemePalette::link}, {L"muted", &ThemePalette::muted}, {L"code", &ThemePalette::code}};
+        // Enumerate keys so an existing empty/invalid value is distinguishable
+        // from a missing entry, and is left available for the user to correct.
+        std::vector<wchar_t> keys(256);
+        while (GetPrivateProfileStringW(section, nullptr, L"", keys.data(), static_cast<DWORD>(keys.size()), iniPath.c_str()) == keys.size() - 2)
+            keys.resize(keys.size() * 2);
+        for (const auto& color : colors) {
+            bool present = false;
+            for (const wchar_t* key = keys.data(); *key; key += wcslen(key) + 1)
+                if (_wcsicmp(key, color.key) == 0) { present = true; break; }
+            if (!present) {
+                const COLORREF value = palette.*color.field;
+                wchar_t text[8]{};
+                swprintf_s(text, L"#%02X%02X%02X", GetRValue(value), GetGValue(value), GetBValue(value));
+                if (!WritePrivateProfileStringW(section, color.key, text, iniPath.c_str()) && settingsError.empty()) {
+                    const DWORD code = GetLastError();
+                    settingsError = L"Missing theme colors could not be saved to:\n" + iniPath + L"\n\n" + SystemError(code);
+                }
+                continue;
+            }
+            std::vector<wchar_t> buffer(128);
+            while (GetPrivateProfileStringW(section, color.key, L"", buffer.data(), static_cast<DWORD>(buffer.size()), iniPath.c_str()) == buffer.size() - 1)
+                buffer.resize(buffer.size() * 2);
+            std::wstring text(buffer.data());
+            const auto first = std::find_if_not(text.begin(), text.end(), [](wchar_t c) { return iswspace(c); });
+            const auto last = std::find_if_not(text.rbegin(), text.rend(), [](wchar_t c) { return iswspace(c); }).base();
+            if (first >= last || last - first != 7 || *first != L'#') continue;
+            unsigned value = 0;
+            bool valid = true;
+            for (auto digit = first + 1; digit != last; ++digit) {
+                const wchar_t c = towlower(*digit);
+                if (c >= L'0' && c <= L'9') value = value * 16 + c - L'0';
+                else if (c >= L'a' && c <= L'f') value = value * 16 + c - L'a' + 10;
+                else { valid = false; break; }
+            }
+            if (valid) palette.*color.field = RGB((value >> 16) & 255, (value >> 8) & 255, value & 255);
+        }
+        return palette;
+    }
+
     void LoadSettings()
     {
         std::vector<wchar_t> module(32768);
@@ -95,7 +148,9 @@ struct App {
         wchar_t theme[32]{};
         GetPrivateProfileStringW(L"appearance", L"theme", L"light", theme, ARRAYSIZE(theme), iniPath.c_str());
         darkTheme = _wcsicmp(theme, L"dark") == 0;
-        rendering.palette = Palette(darkTheme);
+        lightPalette = LoadPalette(false);
+        darkPalette = LoadPalette(true);
+        rendering.palette = darkTheme ? darkPalette : lightPalette;
         wchar_t configured[32768]{};
         GetPrivateProfileStringW(L"font", L"path", L"", configured, ARRAYSIZE(configured), iniPath.c_str());
         std::wstring file(configured);
@@ -142,7 +197,7 @@ struct App {
         const LRESULT events = SendMessageW(source, EM_SETEVENTMASK, 0, 0);
         // WM_SETREDRAW(TRUE) also sets WS_VISIBLE; never send it to the hidden source.
         if (editMode) SendMessageW(source, WM_SETREDRAW, FALSE, 0);
-        rendering.palette = Palette(darkTheme);
+        rendering.palette = darkTheme ? darkPalette : lightPalette;
         CHARFORMAT2W colors{};
         colors.cbSize = sizeof(colors);
         colors.dwMask = CFM_COLOR;
@@ -205,9 +260,9 @@ struct App {
     bool Render()
     {
         if (!renderDirty) return true;
-        std::string rtf;
-        if (!RenderMarkdown(Source(), rendering, rtf)) { Error(L"Could not render this document. The Markdown source is still available in Edit mode."); return false; }
-        struct Stream { const std::string& text; size_t offset = 0; } input{rtf};
+        RenderedMarkdown rendered;
+        if (!RenderMarkdown(Source(), rendering, rendered)) { Error(L"Could not render this document. The Markdown source is still available in Edit mode."); return false; }
+        struct Stream { const std::string& text; size_t offset = 0; } input{rendered.rtf};
         EDITSTREAM stream{};
         stream.dwCookie = reinterpret_cast<DWORD_PTR>(&input);
         stream.pfnCallback = [](DWORD_PTR cookie, LPBYTE buffer, LONG requested, LONG* supplied) -> DWORD {
@@ -221,6 +276,7 @@ struct App {
         const auto position = Remember(preview);
         SendMessageW(preview, EM_STREAMIN, SF_RTF, reinterpret_cast<LPARAM>(&stream));
         if (stream.dwError) { Error(L"Windows could not display the rendered document. The source has been preserved."); return false; }
+        previewMapping = std::move(rendered.mapping);
         SendMessageW(preview, EM_EMPTYUNDOBUFFER, 0, 0);
         SendMessageW(preview, EM_SETMODIFY, FALSE, 0);
         SendMessageW(preview, EM_SETZOOM, dpi, richEditBaseDpi);
@@ -243,6 +299,26 @@ struct App {
         Restore(edit ? source : preview, position);
         if (!edit) HideCaret(preview);
         return true;
+    }
+
+    void EditAt(POINTL point)
+    {
+        const LONG hit = static_cast<LONG>(SendMessageW(preview, RichEditCharFromPos, 0, reinterpret_cast<LPARAM>(&point)));
+        GETTEXTLENGTHEX length{GTL_PRECISE | GTL_NUMCHARS, 1200};
+        const LONG count = static_cast<LONG>(SendMessageW(source, EM_GETTEXTLENGTHEX, reinterpret_cast<WPARAM>(&length), 0));
+        LONG start = std::clamp<LONG>(previewMapping.SourceAt(hit), 0, count);
+        if (start > 0 && start < count) {
+            wchar_t pair[3]{};
+            TEXTRANGEW range{{start - 1, start + 1}, pair};
+            // Read only the two adjacent UTF-16 units; do not copy the document.
+            if (SendMessageW(source, EM_GETTEXTRANGE, 0, reinterpret_cast<LPARAM>(&range)) == 2 &&
+                pair[0] >= 0xd800 && pair[0] <= 0xdbff && pair[1] >= 0xdc00 && pair[1] <= 0xdfff)
+                --start;
+        }
+        if (!Mode(true)) return;
+        CHARRANGE caret{start, start};
+        SendMessageW(source, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&caret));
+        SendMessageW(source, EM_SCROLLCARET, 0, 0);
     }
 
     bool ChooseFile(bool save, std::wstring& selected)
@@ -382,6 +458,18 @@ LRESULT CALLBACK ControlProc(HWND control, UINT message, WPARAM wparam, LPARAM l
 {
     auto& app = *reinterpret_cast<App*>(data);
     const bool view = control == app.preview;
+    if (view && !app.editMode && message == WM_LBUTTONDBLCLK &&
+        !(wparam & (MK_CONTROL | MK_SHIFT | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2)) &&
+        !((GetKeyState(VK_CONTROL) | GetKeyState(VK_SHIFT) | GetKeyState(VK_MENU) |
+           GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000)) {
+        POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        RECT client{};
+        GetClientRect(control, &client);
+        if (PtInRect(&client, point)) {
+            app.EditAt({point.x, point.y});
+            return 0;
+        }
+    }
     if (message == WM_KEYDOWN) {
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -576,6 +664,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     if (args && count > 1) app.Open(args[1]);
     LocalFree(args);
     SetFocus(app.editMode ? app.source : app.preview);
+    if (!app.settingsError.empty()) app.Error(app.settingsError);
     MSG message{};
     int result;
     while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {

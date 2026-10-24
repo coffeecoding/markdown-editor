@@ -65,6 +65,7 @@ Untitled), with `*` for unsaved changes. The document fills the client area.
 | Edit | Ctrl+1 |
 | View | Ctrl+2 |
 | Toggle Edit/View | Ctrl+Tab |
+| Edit at the corresponding source character | Double-click View, without modifiers |
 | Select all / copy | Ctrl+A / Ctrl+C, in either mode |
 | Cut / paste | Ctrl+X / Ctrl+V or Shift+Delete / Shift+Insert, in Edit |
 | Undo / redo | Ctrl+Z / Ctrl+Y or Ctrl+Shift+Z, in Edit |
@@ -84,7 +85,37 @@ Rendering occurs on opening a document and on entering View after a source
 change. The source control stays alive, including its selection, scrolling, and
 up to 1,000 undo actions. Each mode retains its own selection and scroll state.
 After rerendering, View restores its previous character offsets and approximate
-scroll position; it does not map positions semantically between source and View.
+scroll position.
+
+An unmodified left-button double-click in View enters Edit at the corresponding
+Markdown source character and scrolls the collapsed caret into view. This also
+works in document margins and blank document space. It deliberately replaces
+the previous source selection and scroll position; ordinary menu/keyboard mode
+changes keep their existing behavior. Source text, undo/redo, and unsaved state
+are preserved. Single-click/drag selection, Ctrl+click links, context menus, and
+double-click word selection in Edit continue to use the native controls.
+
+Navigation uses 16-byte source-range spans recorded from MD4C's input-buffer
+text callbacks, with UTF-16 offsets and one unit per Rich Edit paragraph break.
+Directly sourced text maps by character offset, including repeated text,
+escapes, code, and Unicode. Hidden Markdown delimiters create source gaps.
+Decoded entities are atomic: every displayed UTF-16 unit maps to the start of
+its source spelling. Unknown entity names that remain verbatim map directly.
+
+Generated bullets, labels, destinations, breaks, and blank space choose the
+nearest mapped span by rendered-character distance, preferring the preceding
+span on ties. Approaching from afterward uses that span's source end;
+approaching from before uses its source beginning. Documents without mapped
+text use zero. Native Rich Edit determines the clicked character. The source
+offset is clamped to its bounds and moved backward if needed to avoid splitting
+a surrogate pair, using a two-unit native text-range read.
+
+Temporary UTF-8-to-UTF-16 checkpoints occur about every 256 bytes at codepoint
+boundaries; one cached resolution avoids rescanning nearby callback prefixes.
+There is no per-character table or additional persistent source copy. The
+mapping is replaced only after successful preview streaming, including theme
+refreshes. Parsing, streaming, and navigation keep the existing rendering
+lifecycle and dependencies.
 
 ## Light and dark themes
 
@@ -111,10 +142,46 @@ preserving existing font settings:
 theme=dark
 ```
 
-Missing or invalid values default to Light. If the preference cannot be written,
-the selected theme stays active for this session and an error identifies the
-configuration path. The executable's directory must be writable to retain the
-choice across launches.
+Missing or invalid theme selections default to Light. If the preference cannot
+be written, the selected theme stays active for this session and an error
+identifies the configuration path. The executable's directory must be writable
+to retain the choice across launches.
+
+Both document palettes are also stored in that INI. On startup, the app adds
+missing color entries with the defaults below, preserving existing colors,
+font settings, theme selection, comments, and unrelated entries. Existing
+installations gain these entries on their next launch. Edit the colors and
+restart to apply them; switching themes selects the palettes loaded at startup
+and saves only `[appearance] theme`.
+
+```ini
+[theme.light]
+background=#F5F3EE
+text=#242424
+link=#005BAE
+muted=#62605C
+code=#E8E5DE
+
+[theme.dark]
+background=#000000
+text=#D0D0D0
+link=#79B8FF
+muted=#A0A0A0
+code=#181818
+```
+
+`background` is the document background; `text` is the main text color; `link`
+colors links; `muted` colors quotes and rules (and fallback labels); `code` is
+the inline/block code background. Values accept `#RRGGBB`, case-insensitive,
+with surrounding whitespace. An invalid or empty value falls back individually
+to its compiled default and remains unchanged in the INI for correction. If
+adding missing defaults fails, the editor continues with loaded/default colors
+and shows one configuration persistence error after creating its window.
+
+These ten settings cover the five document color roles in each theme. Native
+title-bar requests, Windows-managed menus, selection highlighting, and dialogs
+retain their existing behavior. There is no settings UI, file watcher, or
+continuous background work. `markdown-editor.ini.example` includes all keys.
 
 Switching preserves source text, undo/redo, unsaved state, selection, and scroll
 position. View regenerates once and restores its selection and approximate
@@ -225,9 +292,9 @@ Ninja on Windows x64. Release build completed without warnings.
 
 | Required shipped file | Bytes |
 | --- | ---: |
-| `markdown-editor.exe` | 292,352 |
+| `markdown-editor.exe` | 329,728 |
 | `MD4C-LICENSE.txt` | 1,096 |
-| **Total: 2 files** | **293,448 (286.57 KiB)** |
+| **Total: 2 files** | **330,824 (323.07 KiB)** |
 
 Only Windows DLLs are imported; Rich Edit is loaded from Windows System32.
 No VC runtime redistribution is needed. Optional configuration, user fonts,
@@ -251,7 +318,7 @@ both UTF-16 BOM encodings, and LF/CRLF retention. It checks a configured Arial
 TTF in both controls and graceful fallback for a missing file. The prior
 clipboard text is restored when present.
 
-The theme update adds 2,048 bytes to the executable (now 285.5 KiB), with no
+The earlier theme update added 2,048 bytes to the executable, with no
 bundled dependency added. The extended smoke check passed both palettes for
 source, headings/body, links including detected URLs, quotes/rules, and inline
 and block code. It checks document backgrounds through the native control API,
@@ -281,3 +348,92 @@ focused, link launching, shutdown prompts, and a font absent from the system
 font inventory still need manual review. This execution environment prevented
 foreground keyboard automation, so accelerator behavior is implemented and
 documented but not claimed as interactively verified. Startup was not timed.
+
+The earlier editable-palette and line-navigation update added 36,352 bytes over
+the prior 292,352-byte executable, producing the 328,704-byte baseline. Precise
+cursor navigation adds **1,024 bytes (0.31%)**, producing the shipped
+**329,728-byte (322 KiB)** executable, with no new dependencies. The extended
+native smoke check verifies
+all ten defaults are populated, partial and custom palettes in both themes,
+case and whitespace handling, invalid/empty entries, preserved settings and
+comments, restart application, startup-only color loading, and one startup
+error for an unwritable configuration while loaded/default colors remain active.
+
+Navigation checks assert exact UTF-16 source offsets within formatted words,
+links, escapes, and repeated text. They cover headings, paragraphs and
+continuations, nested and ordered lists, quotes, fenced/indented and multiline
+inline code, tabs, links,
+images/HTML fallbacks, generated text, nearest-span ties, repeated text,
+supplementary Unicode and entities, document margins, blank space, empty and
+generated-only documents, and positions beyond 65,535 rendered characters.
+They repeat after edits, wrapping at a narrow width, scrolling, theme refreshes,
+and synthetic 96/144/192 DPI changes, and confirm source/dirty state, undo/redo
+availability and operation, collapsed selections, and scrolling the source caret
+into view. Ordinary mode
+changes, native Edit double-click selection, modified View double-clicks,
+single-click caret positioning, and nonclient scrollbar messages are checked.
+
+Additional renderer checks compare every direct span against actual native Rich
+Edit text, verify every mapped UTF-16 unit, adjacent/multi-unit/supplementary
+entities, unknown entity names, generated gaps and ties, final source extents,
+empty results, failed-render preservation, and sparse checkpoint lookups in
+both directions across long Unicode lines. Run them from ordinary PowerShell:
+
+```powershell
+& '.\App Demo\tests\check.ps1' -Benchmark
+& '.\App Demo\smoke.ps1'
+```
+
+`check.ps1` rebuilds Release and builds the separate native check executable
+under `build\mapping-tests`; no check code is shipped. `-Benchmark` also prints
+mapping vector sizes/capacities, temporary checkpoint storage, and renderer
+timings for the existing large sample and a densely formatted single line.
+Both the renderer checks and the extended integration smoke suite passed.
+
+The before/after comparison below uses identical MSVC `/O1` + LTCG builds. The
+large sample is the smoke suite's 5,000 repetitions (405,000 file UTF-16 units
+with CRLF; 385,000 normalized source units). The dense sample repeats this unit
+plus a trailing space 10,000 times on one line (460,000 UTF-16 units; 480,000
+UTF-8 bytes):
+
+```text
+**bold** *em* `code` [label](url) &amp; \* 😀
+```
+
+Sizes describe one result's vector payload; allocator overhead,
+vector objects, the eight-byte cached resolution, existing source/RTF buffers,
+and the previous preview mapping retained during refresh are excluded.
+
+| Measurement | Large before | Large after | Dense before | Dense after |
+| --- | ---: | ---: | ---: | ---: |
+| Persistent span count | 15,000 | 40,000 | 10,001 | 110,000 |
+| Live span bytes | 180,000 | 640,000 | 120,012 | 1,760,000 |
+| Span vector capacity, bytes | 218,484 | 655,440 | 145,656 | 2,212,080 |
+| Temporary lookup live bytes | 320,016 | 12,032 | 16 | 15,000 |
+| Temporary lookup capacity, bytes | 436,960 | 12,792 | 16 | 19,184 |
+| Renderer median, ms | 9.27 | 8.00 | 12.32 | 13.52 |
+| Native View theme refresh median, ms | 45.886 | 44.444 | 360.674 | 360.525 |
+
+Retained mapping capacity grew by 436,956 bytes for the large document and
+2,066,424 bytes for the dense one. Temporary lookup capacity changed by
+−424,168 and +19,168 bytes respectively. The large sample's temporary lookup
+storage shrinks by replacing its line table with sparse checkpoints. The dense
+sample's larger map is expected: precise offsets require separate spans at
+hidden delimiters and entity boundaries, while line-only navigation could
+collapse them. Its 110,000 spans each remain exactly 16 bytes. No per-character
+mapping table was introduced.
+
+Renderer figures are medians of three runs, each with three warmups and nine
+timed renders: −1.27 ms for the large sample and +1.20 ms for the dense sample.
+Native figures include parsing, RTF streaming, and restoring View, using three
+warmups and seven timed theme refreshes per sample/version; their differences
+are −1.442 ms and −0.149 ms. These local hidden-window measurements have normal
+timing noise and are observations, not performance guarantees. An initial
+dense-render slowdown was traced to rescanning checkpoint prefixes for nearby
+callbacks and removed by caching one recent resolution.
+
+These checks send native messages to hidden windows. Physical double-click and
+drag selection, Ctrl+click launching, visible caret and palette appearance,
+native title bars, and actual movement between monitors still need manual
+review. Synthetic drag messages retain View, but this session cannot verify
+selection driven by a physically held mouse button.

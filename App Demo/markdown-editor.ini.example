@@ -3,6 +3,22 @@
 [appearance]
 theme=light
 
+; Restart after editing document colors. Use #RRGGBB (case-insensitive).
+; Missing entries are added on launch. Invalid entries use their defaults.
+[theme.light]
+background=#F5F3EE
+text=#242424
+link=#005BAE
+muted=#62605C
+code=#E8E5DE
+
+[theme.dark]
+background=#000000
+text=#D0D0D0
+link=#79B8FF
+muted=#A0A0A0
+code=#181818
+
 ; Restart after changing the font setting.
 ; A relative path is resolved beside the executable. Do not add quotes.
 ; Remove this setting (or the INI file) to restore the default fonts.

@@ -25,3 +25,10 @@ build\win32_app_demo.exe
 ```
 
 From a normal shell, first run Visual Studio's `VsDevCmd.bat` with `-arch=x64 -host_arch=x64 -winsdk=10.0.26100.0`, then use the same CMake commands.
+
+## Todos MarkdownEditor
+
+- [ ] Support Table rendering
+- [ ] Support Emojis
+- [ ] Open Recents
+- [ ] Status bar with useful infos?

@@ -5,6 +5,7 @@ extern "C" {
 #include "entity.h"
 }
 #include <cstdint>
+#include <algorithm>
 #include <vector>
 
 namespace {
@@ -76,15 +77,71 @@ std::wstring Attribute(const MD_ATTRIBUTE& attr)
 
 struct Renderer {
     struct List { bool ordered; unsigned next; bool tight; };
+    struct Checkpoint { MD_SIZE byte; LONG source; };
+    const std::string& input;
     std::string out;
+    std::vector<Checkpoint> checkpoints;
+    Checkpoint resolved{0, 0};
+    SourceMap mapping;
+    LONG displayed = 0;
     std::vector<List> lists;
     std::vector<bool> firstItemParagraph;
     unsigned quoteDepth = 0;
     bool paragraphOpen = false;
 
+    explicit Renderer(const std::string& utf8) : input(utf8)
+    {
+        checkpoints.push_back({0, 0});
+        LONG sourceOffset = 0;
+        for (size_t i = 0; i < input.size(); ++i) {
+            const auto c = static_cast<unsigned char>(input[i]);
+            // UTF-8 was validated by ToUtf8. Count only leading bytes, with
+            // supplementary characters taking two UTF-16 units.
+            if ((c & 0xc0) != 0x80) {
+                if (i - checkpoints.back().byte >= 256)
+                    checkpoints.push_back({static_cast<MD_SIZE>(i), sourceOffset});
+                sourceOffset += c >= 0xf0 ? 2 : 1;
+            }
+        }
+    }
+
+    LONG SourceAt(size_t offset)
+    {
+        // Nearby callbacks normally advance through the same checkpoint. Reuse
+        // the last resolution rather than repeatedly scanning its UTF-8 prefix.
+        // Backward or distant offsets always start at a sparse checkpoint.
+        if (offset < resolved.byte || offset - resolved.byte > 256)
+            resolved = *(std::upper_bound(checkpoints.begin(), checkpoints.end(), offset,
+                [](size_t at, const Checkpoint& candidate) { return at < candidate.byte; }) - 1);
+        LONG position = resolved.source;
+        for (size_t i = resolved.byte; i < offset; ++i) {
+            const auto c = static_cast<unsigned char>(input[i]);
+            if ((c & 0xc0) != 0x80) position += c >= 0xf0 ? 2 : 1;
+        }
+        resolved = {static_cast<MD_SIZE>(offset), position};
+        return position;
+    }
+
+    void Emit(const std::wstring& text, LONG sourceBegin = -1, LONG sourceEnd = -1)
+    {
+        const LONG begin = displayed;
+        Escape(out, text);
+        displayed += static_cast<LONG>(text.size() - std::count(text.begin(), text.end(), L'\r'));
+        if (sourceBegin < 0 || begin == displayed) return;
+        auto& spans = mapping.spans;
+        // Only merge direct mappings with contiguous source and display ranges.
+        // Entity spans stay separate, retaining their individual source anchors.
+        if (!spans.empty() && spans.back().end == begin && spans.back().sourceEnd == sourceBegin &&
+            spans.back().end - spans.back().begin == spans.back().sourceEnd - spans.back().sourceBegin &&
+            displayed - begin == sourceEnd - sourceBegin) {
+            spans.back().end = displayed;
+            spans.back().sourceEnd = sourceEnd;
+        } else spans.push_back({begin, displayed, sourceBegin, sourceEnd});
+    }
+
     void EndParagraph()
     {
-        if (paragraphOpen) { out += "\\par\n"; paragraphOpen = false; }
+        if (paragraphOpen) { out += "\\par\n"; ++displayed; paragraphOpen = false; }
     }
 
     void BeginParagraph(const std::string& extra = {})
@@ -110,8 +167,8 @@ struct Renderer {
         }
         case MD_BLOCK_LI: {
             BeginParagraph("\\fi-260 ");
-            if (!lists.empty() && lists.back().ordered) out += std::to_string(lists.back().next++) + ".\\tab ";
-            else out += "\\u8226?\\tab ";
+            if (!lists.empty() && lists.back().ordered) Emit(std::to_wstring(lists.back().next++) + L".\t");
+            else Emit(L"\x2022\t");
             firstItemParagraph.push_back(true);
             break;
         }
@@ -125,10 +182,10 @@ struct Renderer {
             BeginParagraph("\\b\\sb160\\sa140\\fs" + std::to_string(sizes[level - 1]) + " "); break;
         }
         case MD_BLOCK_CODE: BeginParagraph("\\f1\\fs22\\sa140\\highlight4 "); break;
-        case MD_BLOCK_HTML: BeginParagraph("\\f1\\fs22\\cf3 "); Escape(out, L"[HTML source]\n"); break;
+        case MD_BLOCK_HTML: BeginParagraph("\\f1\\fs22\\cf3 "); Emit(L"[HTML source]\n"); break;
         // Windows Rich Edit does not draw RTF paragraph borders. Use a visible
         // text rule so separators survive both native display and copying.
-        case MD_BLOCK_HR: BeginParagraph("\\cf3\\sa180 "); Escape(out, std::wstring(24, L'\x2500')); EndParagraph(); break;
+        case MD_BLOCK_HR: BeginParagraph("\\cf3\\sa180 "); Emit(std::wstring(24, L'\x2500')); EndParagraph(); break;
         default: break;
         }
         return 0;
@@ -153,7 +210,7 @@ struct Renderer {
         case MD_SPAN_STRONG: out += "{\\b "; break;
         case MD_SPAN_CODE: out += "{\\f1\\fs22\\highlight4 "; break;
         case MD_SPAN_A: out += "{\\cf2\\ul "; break;
-        case MD_SPAN_IMG: out += "{\\cf3 "; Escape(out, L"[Image: "); break;
+        case MD_SPAN_IMG: out += "{\\cf3 "; Emit(L"[Image: "); break;
         default: out += '{'; break;
         }
         return 0;
@@ -164,9 +221,9 @@ struct Renderer {
         // Visible destinations retain meaning when copying rendered text and
         // let Rich Edit detect ordinary URLs without executable RTF fields.
         if (type == MD_SPAN_A) {
-            Escape(out, L" <" + Attribute(static_cast<MD_SPAN_A_DETAIL*>(detail)->href) + L">");
+            Emit(L" <" + Attribute(static_cast<MD_SPAN_A_DETAIL*>(detail)->href) + L">");
         } else if (type == MD_SPAN_IMG) {
-            Escape(out, L" — " + Attribute(static_cast<MD_SPAN_IMG_DETAIL*>(detail)->src) + L"]");
+            Emit(L" — " + Attribute(static_cast<MD_SPAN_IMG_DETAIL*>(detail)->src) + L"]");
         }
         out += '}';
         return 0;
@@ -174,20 +231,53 @@ struct Renderer {
 
     int Text(MD_TEXTTYPE type, const char* text, MD_SIZE size)
     {
-        if (type == MD_TEXT_SOFTBR) out += ' ';
-        else if (type == MD_TEXT_BR) out += "\\line ";
-        else if (type == MD_TEXT_NULLCHAR) Escape(out, L"\xfffd");
-        else if (type == MD_TEXT_ENTITY) Escape(out, DecodeEntity(text, size));
-        else Escape(out, FromUtf8(std::string(text, size)));
+        // MD4C also emits static strings (breaks, code indentation, etc.).
+        // Only pointers into this parse's input establish a source location;
+        // repeated text is never searched for or guessed.
+        const auto address = reinterpret_cast<uintptr_t>(text);
+        const auto base = reinterpret_cast<uintptr_t>(input.data());
+        const bool sourced = address >= base && address - base < input.size() &&
+            size <= input.size() - (address - base);
+        if (type == MD_TEXT_SOFTBR) Emit(L" ");
+        else if (type == MD_TEXT_BR) Emit(L"\n");
+        else if (type == MD_TEXT_NULLCHAR) Emit(L"\xfffd");
+        else if (sourced) {
+            const LONG begin = SourceAt(address - base);
+            const auto value = type == MD_TEXT_ENTITY ? DecodeEntity(text, size) : FromUtf8(std::string(text, size));
+            // Entity spelling is ASCII; decoded entities are always shorter.
+            // Unrecognized entity names remain direct, verbatim source text.
+            Emit(value, begin, begin + static_cast<LONG>(type == MD_TEXT_ENTITY ? size : value.size()));
+        } else if (type == MD_TEXT_ENTITY) Emit(DecodeEntity(text, size));
+        else Emit(FromUtf8(std::string(text, size)));
         return 0;
     }
 };
 }
 
-bool RenderMarkdown(const std::wstring& source, const RenderOptions& options, std::string& rtf)
+LONG SourceMap::SourceAt(LONG renderedOffset) const
+{
+    if (spans.empty()) return 0;
+    const auto next = std::upper_bound(spans.begin(), spans.end(), renderedOffset,
+        [](LONG at, const SourceSpan& span) { return at < span.begin; });
+    if (next == spans.begin()) return next->sourceBegin;
+    const auto previous = next - 1;
+    if (renderedOffset < previous->end) {
+        if (previous->end - previous->begin == previous->sourceEnd - previous->sourceBegin)
+            return previous->sourceBegin + renderedOffset - previous->begin;
+        return previous->sourceBegin; // Decoded entity: atomic source anchor.
+    }
+    if (next == spans.end()) return previous->sourceEnd;
+    // Distance to the closest displayed character; equal distances use the
+    // preceding span. Approaching a span from a gap selects its source edge.
+    return renderedOffset - (previous->end - 1) <= next->begin - renderedOffset ? previous->sourceEnd : next->sourceBegin;
+}
+
+bool RenderMarkdown(const std::wstring& source, const RenderOptions& options, RenderedMarkdown& result)
 {
     if (options.flavor != MarkdownFlavor::CommonMark) return false;
-    Renderer renderer;
+    const auto utf8 = ToUtf8(source);
+    if (!source.empty() && utf8.empty()) return false;
+    Renderer renderer(utf8);
     renderer.out = "{\\rtf1\\ansi\\ansicpg1252\\deff0\\uc1{\\fonttbl{\\f0\\fnil ";
     Escape(renderer.out, options.bodyFont);
     renderer.out += ";}{\\f1\\fmodern ";
@@ -203,11 +293,10 @@ bool RenderMarkdown(const std::wstring& source, const RenderOptions& options, st
     parser.enter_span = [](MD_SPANTYPE type, void*, void* data) { return static_cast<Renderer*>(data)->EnterSpan(type); };
     parser.leave_span = [](MD_SPANTYPE type, void* detail, void* data) { return static_cast<Renderer*>(data)->LeaveSpan(type, detail); };
     parser.text = [](MD_TEXTTYPE type, const char* text, MD_SIZE size, void* data) { return static_cast<Renderer*>(data)->Text(type, text, size); };
-    const auto utf8 = ToUtf8(source);
-    if (!source.empty() && utf8.empty()) return false;
     if (md_parse(utf8.data(), static_cast<MD_SIZE>(utf8.size()), &parser, &renderer) != 0) return false;
     renderer.EndParagraph();
     renderer.out += '}';
-    rtf = std::move(renderer.out);
+    result.rtf = std::move(renderer.out);
+    result.mapping = std::move(renderer.mapping);
     return true;
 }

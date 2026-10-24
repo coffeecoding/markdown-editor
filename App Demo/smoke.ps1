@@ -14,6 +14,7 @@ public static class MdSmoke {
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr w, int id);
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr w);
     [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr w);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr w);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr w, StringBuilder b, int n);
     [DllImport("user32.dll",EntryPoint="SendMessageW")] public static extern IntPtr Send(IntPtr w, uint m, IntPtr p, IntPtr l);
     [DllImport("user32.dll",EntryPoint="SendMessageW",CharSet=CharSet.Unicode)] public static extern IntPtr Text(IntPtr w, uint m, IntPtr p, string text);
@@ -31,6 +32,8 @@ public static class MdSmoke {
     public static uint SystemDpi() {var old=SetThreadDpiAwarenessContext((IntPtr)(-4));try{return GetDpiForSystem();}finally{SetThreadDpiAwarenessContext(old);}}
     [StructLayout(LayoutKind.Sequential)] public struct Rect { public int left,top,right,bottom; }
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr w, out Rect r);
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr w, out Rect r);
+    [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr w, int x, int y, int width, int height, bool repaint);
     [DllImport("user32.dll",EntryPoint="SendMessageW")] public static extern IntPtr Rectangle(IntPtr w,uint m,IntPtr p,ref Rect r);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr w,IntPtr dc,uint flags);
     [DllImport("user32.dll")] public static extern bool OpenClipboard(IntPtr w);
@@ -47,9 +50,9 @@ public static class MdSmoke {
     public static string Class(IntPtr w) { var b=new StringBuilder(256); GetClassName(w,b,256); return b.ToString(); }
     public static IntPtr Find(uint pid, string cls) { IntPtr found=IntPtr.Zero; EnumWindows((w,l)=> {uint p;GetWindowThreadProcessId(w,out p);if(p==pid && Class(w)==cls){found=w;return false;}return true;},IntPtr.Zero);return found; }
     public static IntPtr Edit(IntPtr parent) {IntPtr found=IntPtr.Zero;EnumChildWindows(parent,(w,l)=>{int id=GetDlgCtrlID(w);if(Class(w)=="Edit" && (id==1001||id==1148||id==1152)){found=w;return false;}return true;},IntPtr.Zero);return found;}
-    public static string Content(IntPtr w) {var b=new StringBuilder(65536);Read(w,13,(IntPtr)b.Capacity,b);return b.ToString();}
+    public static string Content(IntPtr w) {var b=new StringBuilder(Send(w,14,IntPtr.Zero,IntPtr.Zero).ToInt32()+1);Read(w,13,(IntPtr)b.Capacity,b);return b.ToString();}
     public static string Clipboard() {if(!OpenClipboard(IntPtr.Zero))return null;try{var h=GetClipboardData(13);var p=GlobalLock(h);try{return p==IntPtr.Zero?null:Marshal.PtrToStringUni(p);}finally{if(p!=IntPtr.Zero)GlobalUnlock(h);}}finally{CloseClipboard();}}
-    public static byte[] Remote(uint pid,IntPtr w,uint msg,IntPtr wp,byte[] bytes) {var p=OpenProcess(0x38,false,pid);if(p==IntPtr.Zero)throw new Exception("OpenProcess");var a=VirtualAllocEx(p,IntPtr.Zero,(UIntPtr)bytes.Length,0x3000,4);try{UIntPtr n;if(!WriteProcessMemory(p,a,bytes,(UIntPtr)bytes.Length,out n))throw new Exception("WriteProcessMemory");Send(w,msg,wp,a);if(!ReadProcessMemory(p,a,bytes,(UIntPtr)bytes.Length,out n))throw new Exception("ReadProcessMemory");return bytes;}finally{VirtualFreeEx(p,a,UIntPtr.Zero,0x8000);CloseHandle(p);}}
+    public static byte[] Remote(uint pid,IntPtr w,uint msg,IntPtr wp,byte[] bytes,bool inWParam=false) {var p=OpenProcess(0x38,false,pid);if(p==IntPtr.Zero)throw new Exception("OpenProcess");var a=VirtualAllocEx(p,IntPtr.Zero,(UIntPtr)bytes.Length,0x3000,4);try{UIntPtr n;if(!WriteProcessMemory(p,a,bytes,(UIntPtr)bytes.Length,out n))throw new Exception("WriteProcessMemory");Send(w,msg,inWParam?a:wp,inWParam?wp:a);if(!ReadProcessMemory(p,a,bytes,(UIntPtr)bytes.Length,out n))throw new Exception("ReadProcessMemory");return bytes;}finally{VirtualFreeEx(p,a,UIntPtr.Zero,0x8000);CloseHandle(p);}}
     public static int[] Zoom(uint pid,IntPtr w) {var p=OpenProcess(0x38,false,pid);var a=VirtualAllocEx(p,IntPtr.Zero,(UIntPtr)8,0x3000,4);try{Send(w,1248,a,IntPtr.Add(a,4));var b=new byte[8];UIntPtr n;ReadProcessMemory(p,a,b,(UIntPtr)8,out n);return new[]{BitConverter.ToInt32(b,0),BitConverter.ToInt32(b,4)};}finally{VirtualFreeEx(p,a,UIntPtr.Zero,0x8000);CloseHandle(p);}}
 }
 '@
@@ -69,6 +72,18 @@ function Wait-Window($process, [string]$class = 'NativeMarkdownEditorWindow') {
 }
 function Command($w, [int]$id) { [void][MdSmoke]::Send($w, 273, [IntPtr]$id, [IntPtr]::Zero) }
 function Post-Command($w, [int]$id) { [void][MdSmoke]::PostMessage($w, 273, [IntPtr]$id, [IntPtr]::Zero) }
+function Dismiss-Error($dialog) {
+    # EnumWindows can see a MessageBox before its buttons are initialized.
+    for ($n=0; $n -lt 100; ++$n) {
+        $button = [MdSmoke]::GetDlgItem($dialog,1)
+        if ($button -eq [IntPtr]::Zero) { $button = [MdSmoke]::GetDlgItem($dialog,2) }
+        if ($button -ne [IntPtr]::Zero -and [MdSmoke]::IsWindowEnabled($button)) { break }
+        Start-Sleep -Milliseconds 20
+    }
+    [void][MdSmoke]::PostMessage($button,245,[IntPtr]::Zero,[IntPtr]::Zero) # BM_CLICK
+    for ($n=0; $n -lt 100 -and [MdSmoke]::IsWindow($dialog); ++$n) { Start-Sleep -Milliseconds 20 }
+    if ([MdSmoke]::IsWindow($dialog)) { throw 'Error dialog did not close' }
+}
 function Dialog-Path($process, [string]$path) {
     $dialog = Wait-Window $process '#32770'
     for ($n = 0; $n -lt 100; ++$n) {
@@ -114,6 +129,69 @@ function Check-Background($control, [int]$expected, [string]$name) {
     $actual = [MdSmoke]::Send($control,1091,[IntPtr]::Zero,[IntPtr]$expected).ToInt64()
     Assert ($actual -eq $expected) "$name document background"
 }
+function Read-Selection($process, $control) {
+    $bytes = [MdSmoke]::Remote($process.Id,$control,1076,[IntPtr]::Zero,[byte[]]::new(8))
+    return @([BitConverter]::ToInt32($bytes,0), [BitConverter]::ToInt32($bytes,4))
+}
+function Char-Point($process, $control, [int]$index) {
+    [void][MdSmoke]::Send($control,177,[IntPtr]$index,[IntPtr]$index)
+    [void][MdSmoke]::Send($control,183,[IntPtr]::Zero,[IntPtr]::Zero) # EM_SCROLLCARET
+    $bytes = [MdSmoke]::Remote($process.Id,$control,1062,[IntPtr]$index,[byte[]]::new(8),$true)
+    return @([BitConverter]::ToInt32($bytes,0), [BitConverter]::ToInt32($bytes,4))
+}
+function Mouse-At($control, [int]$message, $point, [int]$keys = 1) {
+    $location = (($point[1] -band 65535) -shl 16) -bor ($point[0] -band 65535)
+    # Coordinates from EM_POSFROMCHAR are device pixels. Match the target's
+    # PMv2 context so User32 does not virtualize synthetic mouse coordinates.
+    $oldContext = [MdSmoke]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    try { [void][MdSmoke]::Send($control,$message,[IntPtr]$keys,[IntPtr]$location) }
+    finally { [void][MdSmoke]::SetThreadDpiAwarenessContext($oldContext) }
+}
+function Navigate($process, $w, [string]$renderNeedle, [string]$sourceNeedle, [int]$occurrence = 0, [string]$label = '', [int]$sourceOccurrence = 0, [int]$renderOffset = 0, [int]$sourceOffset = 0) {
+    Command $w 201
+    $source = [MdSmoke]::GetDlgItem($w,300)
+    $view = [MdSmoke]::GetDlgItem($w,301)
+    $text = [MdSmoke]::Content($view).Replace("`r`n","`r")
+    $index = -1
+    for ($i = 0; $i -le $occurrence; ++$i) { $index = $text.IndexOf($renderNeedle,$index + 1) }
+    if ($index -lt 0) { throw "Missing navigation sample: $renderNeedle" }
+    $index += $renderOffset
+    $raw = [MdSmoke]::Content($source).Replace("`r`n","`n").Replace("`r","`n")
+    $expected = -1
+    for ($i = 0; $i -le $sourceOccurrence; ++$i) { $expected = $raw.IndexOf($sourceNeedle,$expected + 1) }
+    if ($expected -lt 0) { throw "Missing source sample: $sourceNeedle" }
+    $expected += $sourceOffset
+    $before = [MdSmoke]::Content($source)
+    $title = [MdSmoke]::Content($w)
+    $undo = [MdSmoke]::Send($source,198,[IntPtr]::Zero,[IntPtr]::Zero)
+    $redo = [MdSmoke]::Send($source,1109,[IntPtr]::Zero,[IntPtr]::Zero)
+    $modified = [MdSmoke]::Send($source,184,[IntPtr]::Zero,[IntPtr]::Zero)
+    $point = Char-Point $process $view $index
+    # Use the character's left edge so proportional fonts and surrogate pairs
+    # cannot move this hit onto the following character.
+    Mouse-At $view 515 @($point[0],($point[1] + 2))
+    $selection = Read-Selection $process $source
+    Assert (([MdSmoke]::GetWindowLongPtrW($source,-16) -band 0x10000000) -ne 0 -and $selection[0] -eq $expected -and $selection[1] -eq $expected) "double-click maps $renderNeedle + $renderOffset to source offset $expected $label (actual $($selection -join ','))"
+    $caret = [MdSmoke]::Remote($process.Id,$source,1062,[IntPtr]$expected,[byte[]]::new(8),$true)
+    $rect = [MdSmoke+Rect]::new()
+    $oldContext = [MdSmoke]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    try { [void][MdSmoke]::GetClientRect($source,[ref]$rect) }
+    finally { [void][MdSmoke]::SetThreadDpiAwarenessContext($oldContext) }
+    $x = [BitConverter]::ToInt32($caret,0)
+    $y = [BitConverter]::ToInt32($caret,4)
+    Assert ($x -ge 0 -and $x -lt $rect.right -and $y -ge 0 -and $y -lt $rect.bottom) 'navigation scrolls the collapsed source caret into the viewport'
+    Assert ([MdSmoke]::Content($source) -eq $before -and [MdSmoke]::Content($w) -eq $title -and [MdSmoke]::Send($source,198,[IntPtr]::Zero,[IntPtr]::Zero) -eq $undo -and [MdSmoke]::Send($source,1109,[IntPtr]::Zero,[IntPtr]::Zero) -eq $redo -and [MdSmoke]::Send($source,184,[IntPtr]::Zero,[IntPtr]::Zero) -eq $modified) 'navigation preserves source, dirty state, and undo/redo availability'
+}
+function Check-Palette($process, $w, $colors, [string]$label) {
+    $source = [MdSmoke]::GetDlgItem($w,300)
+    $view = [MdSmoke]::GetDlgItem($w,301)
+    Assert ((Read-Color $process $source 'Heading') -eq $colors[1] -and (Read-Color $process $view 'Heading') -eq $colors[1]) "$label source and rendered text"
+    Assert ((Read-Color $process $view 'link') -eq $colors[2] -and (Read-Color $process $view 'https://') -eq $colors[2]) "$label links"
+    Assert ((Read-Color $process $view 'Quote sample') -eq $colors[3] -and (Read-Color $process $view '────') -eq $colors[3]) "$label quotes and rules"
+    Assert ((Read-Color $process $view 'code sample' 96) -eq $colors[4] -and (Read-Color $process $view 'block sample' 96) -eq $colors[4]) "$label code backgrounds"
+    Check-Background $view $colors[0] "$label View"
+    Check-Background $source $colors[0] "$label Edit"
+}
 $testDirectory = Join-Path $PSScriptRoot 'build\smoke'
 New-Item -ItemType Directory -Force -Path $testDirectory | Out-Null
 $ini = Join-Path $testDirectory 'markdown-editor.ini'
@@ -144,6 +222,10 @@ try {
     Assert (([MdSmoke]::GetMenuItemCount($bar) -eq 2) -and ([MdSmoke]::GetMenuItemCount([MdSmoke]::GetSubMenu($bar, 0)) -eq 3) -and ([MdSmoke]::GetMenuItemCount($mode) -eq 4) -and ([MdSmoke]::GetMenuState($mode, 2, 1024) -band 2048)) 'six menu actions with a separator before Dark theme'
     Assert (([MdSmoke]::GetMenuState($mode, 201, 0) -band 8) -ne 0) 'existing file starts in View mode'
     Assert (([MdSmoke]::GetMenuState($mode, 203, 0) -band 8) -eq 0) 'missing theme setting defaults to Light'
+    $populated = [IO.File]::ReadAllText($ini)
+    $defaults = @('[theme.light]','background=#F5F3EE','text=#242424','link=#005BAE','muted=#62605C','code=#E8E5DE',
+        '[theme.dark]','background=#000000','text=#D0D0D0','link=#79B8FF','muted=#A0A0A0','code=#181818')
+    Assert (($defaults | Where-Object { -not $populated.Contains($_) }).Count -eq 0) 'first launch automatically populates all ten palette defaults'
     $timer = [Diagnostics.Stopwatch]::StartNew()
     foreach ($dark in @($false,$true,$false,$true,$false)) {
         $checked = ([MdSmoke]::GetMenuState($mode,203,0) -band 8) -ne 0
@@ -246,10 +328,22 @@ try {
         Post-Command $w 101
         $dialog = Wait-Window $blank '#32770'
         Assert ([MdSmoke]::Content($source).Contains('must survive a failed save') -and [MdSmoke]::Content($w).StartsWith('*')) 'failed save preserves unsaved source and title'
-        Post-Command $dialog 1
+        Dismiss-Error $dialog
     } finally { $lockedFile.Dispose() }
     Assert ([Convert]::ToBase64String([IO.File]::ReadAllBytes($testPath)) -eq [Convert]::ToBase64String($beforeFailure)) 'failed save leaves the original file intact'
-    Command $w 101
+    # Allow filesystem filters to release the deliberately locked file. Keep
+    # this save asynchronous so an unexpected error cannot hang the harness.
+    Start-Sleep -Milliseconds 100
+    for ($retry=0; $retry -lt 5 -and [MdSmoke]::Content($w).StartsWith('*'); ++$retry) {
+        Post-Command $w 101
+        for ($n=0; $n -lt 100 -and [MdSmoke]::Content($w).StartsWith('*'); ++$n) {
+            $dialog = [MdSmoke]::Find($blank.Id,'#32770')
+            if ($dialog -ne [IntPtr]::Zero) { Dismiss-Error $dialog; break }
+            Start-Sleep -Milliseconds 20
+        }
+        if ([MdSmoke]::Content($w).StartsWith('*')) { Start-Sleep -Milliseconds 200 }
+    }
+    Assert (-not [MdSmoke]::Content($w).StartsWith('*')) 'save succeeds after the test releases the file lock'
     Command $w 201
     $view = [MdSmoke]::GetDlgItem($w,301)
     $rect = [MdSmoke+Rect]::new()
@@ -302,10 +396,253 @@ try {
         $messages = [Collections.Generic.List[string]]::new()
         [void][MdSmoke]::EnumChildWindows($dialog, {param($child,$unused) $messages.Add([MdSmoke]::Content($child)); return $true}, [IntPtr]::Zero)
         Assert (($messages -join ' ').Contains('could not be saved')) 'preference write failure displays a clear persistence error'
-        Post-Command $dialog 1
+        Dismiss-Error $dialog
     } finally { $lockedSettings.Dispose() }
     Assert ([IO.File]::ReadAllText($ini).Contains('theme=dark')) 'failed preference write preserves previous stored preference'
     [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+
+    $partialSettings = "; Preserve palette notes Ω`r`n[font]`r`npath=missing.ttf`r`n[appearance]`r`ntheme=dark`r`n[unrelated]`r`nkeep=original`r`n[theme.light]`r`nBACKGROUND=  #aBcDeF `t`r`ntext=#GG0011`r`nlink=#123`r`nmuted=`r`ncode=#11223344`r`n[theme.dark]`r`ntext=#123456`r`nlink=#ff0000`r`n"
+    [IO.File]::WriteAllText($ini,$partialSettings,[Text.Encoding]::Unicode)
+    $partial = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
+    $processes.Add($partial)
+    $w = Wait-Window $partial
+    Command $w 201
+    Check-Palette $partial $w @(0,0x563412,0x0000FF,0xA0A0A0,0x181818) 'partial Dark palette'
+    Command $w 203
+    Check-Palette $partial $w @(0xEFCDAB,0x242424,0xAE5B00,0x5C6062,0xDEE5E8) 'invalid Light entries fall back individually'
+    $populated = [IO.File]::ReadAllText($ini)
+    Assert ($populated.Contains('background=#000000') -and $populated.Contains('muted=#A0A0A0') -and $populated.Contains('code=#181818')) 'partial palettes gain only missing defaults'
+    Assert ($populated.Contains('text=#GG0011') -and $populated.Contains('link=#123') -and $populated.Contains("muted=`r`n") -and $populated.Contains('code=#11223344')) 'invalid and empty color entries remain unchanged'
+    Assert ($populated.Contains('; Preserve palette notes Ω') -and $populated.Contains('path=missing.ttf') -and $populated.Contains('keep=original') -and $populated.Contains("BACKGROUND=  #aBcDeF `t")) 'population and toggling preserve comments, fonts, unrelated settings, and existing colors'
+    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+
+    $customSettings = "[appearance]`r`ntheme=light`r`n[theme.light]`r`nbackground=#112233`r`ntext=#123456`r`nlink=#13579b`r`nmuted=#2468ac`r`ncode=#abcdef`r`n[theme.dark]`r`nbackground=#010203`r`ntext=#fedcba`r`nlink=#89abcd`r`nmuted=#765432`r`ncode=#102030`r`n"
+    [IO.File]::WriteAllText($ini,$customSettings,[Text.Encoding]::ASCII)
+    $custom = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
+    $processes.Add($custom)
+    $w = Wait-Window $custom
+    Command $w 201
+    Check-Palette $custom $w @(0x332211,0x563412,0x9B5713,0xAC6824,0xEFCDAB) 'custom Light palette'
+    Command $w 203
+    Check-Palette $custom $w @(0x030201,0xBADCFE,0xCDAB89,0x325476,0x302010) 'custom Dark palette'
+    # Editing the INI during a session must not reload colors on theme changes.
+    $changedSettings = [IO.File]::ReadAllText($ini).Replace('text=#fedcba','text=#c0ffee')
+    [IO.File]::WriteAllText($ini,$changedSettings,[Text.Encoding]::ASCII)
+    Command $w 203
+    Command $w 203
+    Check-Palette $custom $w @(0x030201,0xBADCFE,0xCDAB89,0x325476,0x302010) 'session keeps startup colors'
+    Assert ([IO.File]::ReadAllText($ini).Contains('text=#c0ffee')) 'theme toggle writes only appearance theme and preserves manual color edits'
+    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+    $restarted = Start-Process -FilePath $exe -ArgumentList "`"$testPath`"" -WindowStyle Hidden -PassThru
+    $processes.Add($restarted)
+    $w = Wait-Window $restarted
+    Command $w 201
+    Assert (([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),203,0) -band 8) -ne 0) 'custom palette restart retains selected Dark theme'
+    Check-Palette $restarted $w @(0x030201,0xEEFFC0,0xCDAB89,0x325476,0x302010) 'restart applies manually edited color'
+    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+
+    # A readable but locked partial INI forces failure while adding defaults.
+    [IO.File]::WriteAllText($ini,"; Locked startup`r`n[theme.light]`r`ntext=#123456`r`n",[Text.Encoding]::ASCII)
+    $lockedStartup = [IO.File]::Open($ini,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        $unwritable = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru
+        $processes.Add($unwritable)
+        $w = Wait-Window $unwritable
+        $dialog = Wait-Window $unwritable '#32770'
+        $messages = [Collections.Generic.List[string]]::new()
+        [void][MdSmoke]::EnumChildWindows($dialog,{param($child,$unused) $messages.Add([MdSmoke]::Content($child)); return $true},[IntPtr]::Zero)
+        Assert (($messages -join ' ').Contains('Missing theme colors could not be saved') -and ($messages -join ' ').Contains($ini)) 'startup shows one palette persistence error after creating the window'
+        $source = [MdSmoke]::GetDlgItem($w,300)
+        Assert ((Read-Color $unwritable $source '') -eq 0x563412) 'startup persistence failure retains loaded custom color'
+        Check-Background $source 0xEEF3F5 'startup persistence failure retains default background'
+        Dismiss-Error $dialog
+        Start-Sleep -Milliseconds 150
+        Assert ([MdSmoke]::Find($unwritable.Id,'#32770') -eq [IntPtr]::Zero -and -not $unwritable.HasExited) 'dismissing the single startup error leaves the editor usable'
+    } finally { $lockedStartup.Dispose() }
+    Assert ([IO.File]::ReadAllText($ini) -eq "; Locked startup`r`n[theme.light]`r`ntext=#123456`r`n") 'failed startup writes preserve existing configuration'
+    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+    Remove-Item -LiteralPath $ini
+    $navigationPath = Join-Path $testDirectory 'navigation.md'
+    $navigationText = @'
+# Heading 😀
+
+Paragraph **bold** &amp; &NotEqualTilde; &#x1F600; 日本語.
+Continuation on another source line.
+Hard break here.[hard-break]
+After the hard break.
+
+Escaped \*stars\* and *italic*; [same](target) then same.
+Tabbed[tab]text and an unknown &unknownEntity;.
+
+- First item
+- Second item
+    - Nested item
+
+8. Ordered item
+9. Next ordered item
+
+> Quoted first line
+> Quoted second line
+
+~~~text
+Fenced code 😀
+
+	Tabbed code
+~~~
+
+    Indented code
+
+[link label](https://example.com/long/generated/destination)
+
+![image alt](picture.png)
+
+<div>HTML contents</div>
+
+Before rule
+
+---
+
+After rule
+
+Repeated same text
+
+Repeated same text
+
+`multi
+line code`
+
+Wrapping sample has enough ordinary words to occupy several visual lines in a narrow window, followed by **wrapped target** near its end.
+
+Last source line Ω
+'@
+    $navigationText = $navigationText.Replace('[hard-break]', '  ').Replace('[tab]', "`t")
+    [IO.File]::WriteAllText($navigationPath,$navigationText,[Text.UTF8Encoding]::new($false))
+    $navigation = Start-Process -FilePath $exe -ArgumentList "`"$navigationPath`"" -WindowStyle Hidden -PassThru
+    $processes.Add($navigation)
+    $w = Wait-Window $navigation
+    Command $w 201
+    $source = [MdSmoke]::GetDlgItem($w,300)
+    $view = [MdSmoke]::GetDlgItem($w,301)
+    $samples = @(
+        @('Heading','Heading'), @('bold','bold',0,2,2), @('&','&amp;'), @('≂̸','&NotEqualTilde;'), @('😀 日本語','&#x1F600;'),
+        @('日本語','日本語',0,2,2), @('Heading 😀','Heading 😀',0,8,8),
+        @(' Continuation','Continuation',0,0,-1), @('Continuation','Continuation',0,12,12), @('After the hard','After the hard'),
+        @('*stars*','*stars',0,0,0), @('*stars*','stars',0,4,3), @('italic','italic',0,3,3),
+        @('Tabbed','Tabbed',0,6,6), @('unknownEntity','unknownEntity',0,5,5),
+        @('First item','First item'), @('Second item','Second item'), @('Nested item','Nested item'),
+        @('Ordered item','Ordered item'), @('Next ordered','Next ordered'),
+        @('Quoted first','Quoted first'), @('Quoted second','Quoted second'),
+        @('Fenced code','Fenced code'), @('Tabbed code','Tabbed code'), @('Indented code','Indented code'),
+        @('link label','link label',0,6,6), @('https://example.com','](https://'),
+        @('[Image:','image alt'), @('image alt','image alt'), @(' alt',' alt'), @('picture.png','](picture.png)'),
+        @('[HTML source]','<div>HTML'), @('<div>HTML','<div>HTML'), @('────────────────────────','Before rule',0,0,11),
+        @('─','After rule',23), @('Repeated same text','Repeated same text'),
+        @('multi','multi'), @('multi line','multi',0,5,5), @('line code','line code',0,4,4), @('Last source','Last source',0,10,10)
+    )
+    foreach ($sample in $samples) {
+        $occurrence = if ($sample.Length -gt 2) { $sample[2] } else { 0 }
+        $renderOffset = if ($sample.Length -gt 3) { $sample[3] } else { 0 }
+        $sourceOffset = if ($sample.Length -gt 4) { $sample[4] } else { 0 }
+        Navigate $navigation $w $sample[0] $sample[1] $occurrence '' 0 $renderOffset $sourceOffset
+    }
+    Navigate $navigation $w 'Repeated same text' 'Repeated same text' 1 'second identical paragraph' 1
+    # Every coordinate is obtained from Rich Edit after scrolling to the sample.
+    # Source remains alive, with its own independently chosen previous position.
+    Command $w 201
+    $point = Char-Point $navigation $view 0
+    [void][MdSmoke]::Send($source,177,[IntPtr]7,[IntPtr]11)
+    $sourceState = Control-State $navigation $source
+    Command $w 200
+    Assert ((Control-State $navigation $source) -eq $sourceState) 'ordinary mode changes retain the prior source selection and scroll'
+    $point = Char-Point $navigation $source 3
+    Mouse-At $source 515 @($point[0],($point[1] + 2))
+    $selection = Read-Selection $navigation $source
+    Assert ($selection[0] -lt $selection[1] -and ([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),200,0) -band 8) -ne 0) 'Edit keeps normal double-click word selection'
+    Command $w 201
+    $point = Char-Point $navigation $view 2
+    foreach ($keys in @(5,9)) { # Shift+left, Ctrl+left
+        Mouse-At $view 515 @($point[0],($point[1] + 2)) $keys
+        Assert (([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),201,0) -band 8) -ne 0) "modified double-click retains View (mouse flags $keys)"
+    }
+    # A control-click on a detected link goes through Rich Edit's existing
+    # handling; a synthetic mouse flag alone never launches an external app.
+    $urlIndex = [MdSmoke]::Content($view).Replace("`r`n","`r").IndexOf('https://')
+    $point = Char-Point $navigation $view $urlIndex
+    Mouse-At $view 515 @($point[0],($point[1] + 2)) 9
+    Assert (([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),201,0) -band 8) -ne 0) 'Ctrl-double-click on a URL preserves View and the link handler'
+    $first = Char-Point $navigation $view 0
+    $last = Char-Point $navigation $view 5
+    Mouse-At $view 513 @($first[0],($first[1] + 2))
+    $selection = Read-Selection $navigation $view
+    Assert ($selection[0] -eq 0 -and $selection[1] -eq 0) 'single-click keeps native preview caret positioning'
+    Mouse-At $view 512 @($last[0],($last[1] + 2))
+    Mouse-At $view 514 @($last[0],($last[1] + 2)) 0
+    $selection = Read-Selection $navigation $view
+    Assert (([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),201,0) -band 8) -ne 0) 'single-click and drag messages retain View (physical drag selection needs manual review)'
+    # A double-click in the document's left margin still hit-tests its line.
+    [void](Char-Point $navigation $view 0)
+    Mouse-At $view 515 @(1,($first[1] + 2))
+    $selection = Read-Selection $navigation $source
+    Assert ($selection[0] -eq 2 -and $selection[1] -eq 2 -and ([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),200,0) -band 8) -ne 0) 'double-click in left document margin enters Edit after the hidden heading delimiter'
+    [void][MdSmoke]::MoveWindow($w,0,0,360,420,$false)
+    Navigate $navigation $w 'wrapped target' 'wrapped target' 0 'after wrapping at a narrow width' 0 9 9
+    foreach ($testDpi in @(96,144,192)) {
+        Command $w 201
+        $rect = [MdSmoke+Rect]::new()
+        [void][MdSmoke]::GetWindowRect($w,[ref]$rect)
+        [void][MdSmoke]::Rectangle($w,736,[IntPtr](($testDpi -shl 16) -bor $testDpi),[ref]$rect)
+        Command $w 203
+        Navigate $navigation $w 'wrapped target' 'wrapped target' 0 "after wrapping, scrolling, theme refresh, and $testDpi DPI" 0 9 9
+    }
+    # Navigation must leave actual undo and redo records usable, including a
+    # pending redo before the first navigation and a dirty edit afterward.
+    [void][MdSmoke]::Send($source,177,[IntPtr](-1),[IntPtr](-1))
+    [void][MdSmoke]::Text($source,194,[IntPtr]1,"`r`n`r`nNew paragraph after edit")
+    [void][MdSmoke]::Send($source,199,[IntPtr]::Zero,[IntPtr]::Zero)
+    Navigate $navigation $w 'Heading' 'Heading' 0 'with a pending redo'
+    [void][MdSmoke]::Send($source,1108,[IntPtr]::Zero,[IntPtr]::Zero)
+    Navigate $navigation $w 'New paragraph' 'New paragraph' 0 'after edit and rerender' 0 8 8
+    [void][MdSmoke]::Send($source,199,[IntPtr]::Zero,[IntPtr]::Zero)
+    Assert (-not [MdSmoke]::Content($source).Contains('New paragraph')) 'undo still works after double-click navigation'
+    [void][MdSmoke]::Send($source,1108,[IntPtr]::Zero,[IntPtr]::Zero)
+    Assert ([MdSmoke]::Content($source).Contains('New paragraph')) 'redo still works after double-click navigation'
+    Command $w 101
+    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+
+    # Short documents leave blank client space below the last rendered line.
+    $blankPath = Join-Path $testDirectory 'blank-space.md'
+    [IO.File]::WriteAllText($blankPath,"# Top 😀`n`nBottom Ω")
+    $blankSpace = Start-Process -FilePath $exe -ArgumentList "`"$blankPath`"" -WindowStyle Hidden -PassThru
+    $processes.Add($blankSpace)
+    $w = Wait-Window $blankSpace
+    Command $w 201
+    $source = [MdSmoke]::GetDlgItem($w,300)
+    $view = [MdSmoke]::GetDlgItem($w,301)
+    $rect = [MdSmoke+Rect]::new()
+    [void][MdSmoke]::GetClientRect($view,[ref]$rect)
+    # WM_NCLBUTTONDBLCLK with HTVSCROLL must never enter Edit.
+    [void][MdSmoke]::PostMessage($view,163,[IntPtr]7,[IntPtr]::Zero)
+    [void][MdSmoke]::PostMessage($view,514,[IntPtr]::Zero,[IntPtr]::Zero)
+    [void][MdSmoke]::PostMessage($view,31,[IntPtr]::Zero,[IntPtr]::Zero) # WM_CANCELMODE ends native scrollbar tracking
+    [void][MdSmoke]::Send($view,0,[IntPtr]::Zero,[IntPtr]::Zero)
+    Assert (([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),201,0) -band 8) -ne 0) 'nonclient scrollbar double-click retains View'
+    Mouse-At $view 515 @([int]($rect.right / 2),($rect.bottom - 2))
+    $selection = Read-Selection $blankSpace $source
+    Assert ($selection[0] -eq 18 -and $selection[1] -eq 18 -and ([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),200,0) -band 8) -ne 0) 'double-click in blank document space maps to the final source end'
+    [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+    foreach ($emptyText in @('',"`n`n",'---','![](picture.png)')) {
+        [IO.File]::WriteAllText($blankPath,$emptyText)
+        $emptyApp = Start-Process -FilePath $exe -ArgumentList "`"$blankPath`"" -WindowStyle Hidden -PassThru
+        $processes.Add($emptyApp)
+        $w = Wait-Window $emptyApp
+        Command $w 201
+        $source = [MdSmoke]::GetDlgItem($w,300)
+        $view = [MdSmoke]::GetDlgItem($w,301)
+        Mouse-At $view 515 @(30,30)
+        $selection = Read-Selection $emptyApp $source
+        Assert ($selection[0] -eq 0 -and $selection[1] -eq 0 -and ([MdSmoke]::GetMenuState([MdSmoke]::GetMenu($w),200,0) -band 8) -ne 0) "document without sourced spans maps safely to zero (length $($emptyText.Length))"
+        [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
+    }
     foreach ($encoding in @([Text.UTF8Encoding]::new($false),[Text.UnicodeEncoding]::new($false,$true),[Text.UnicodeEncoding]::new($true,$true))) {
         $encodedPath = Join-Path $testDirectory ($encoding.CodePage.ToString() + '.md')
         [IO.File]::WriteAllText($encodedPath,"# Encoding`nUnicode Ω`n",$encoding)
@@ -346,6 +683,7 @@ try {
     Write-Output "Large document ($($largeText.Length) characters) View theme switch: $($timer.ElapsedMilliseconds) ms"
     Assert ((Control-State $large $view) -eq $viewState -and (Control-State $large $source) -eq $sourceState) 'large document theme switch preserves selections and nonzero scroll positions in both controls'
     Assert (-not [MdSmoke]::Content($w).StartsWith('*')) 'large document theme switch leaves source clean'
+    Navigate $large $w 'bold' 'bold' 3000 'beyond the 16-bit character range' 3000 2 2
     [void][MdSmoke]::Send($w,16,[IntPtr]::Zero,[IntPtr]::Zero)
     Remove-Item -LiteralPath $ini
     Write-Output 'Smoke check complete. Physical mixed-DPI monitor movement and interactive keyboard/mouse use still need manual review.'
