@@ -196,6 +196,8 @@ These timings depend on fonts and hardware; run the benchmark for local results.
 - [ ] Application license
 - [ ] Build pipeline and GitHub releases
 - [ ] Configurable line height in edit-mode
+- [ ] Detect if currently open file was changed outside -> show dialog w button to reload
+- [ ] Support Ctrl+Z and Ctrl+Y, currently doesnt seem to work correctly
 
 ### Further down the road
 
